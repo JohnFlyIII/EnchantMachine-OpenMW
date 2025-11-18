@@ -1,0 +1,16 @@
+page_name: "Dwemer Enchanting Machine"
+page_description: "A powerful Dwemer device for advanced enchanting"
+
+settings_group_name: "Machine Settings"
+
+setting_enable_name: "Enable Machine"
+setting_enable_desc: "Turn the enchanting machine on or off"
+
+setting_multiplier_name: "Enchant Power Multiplier"
+setting_multiplier_desc: "Maximum enchantment value multiplier compared to vanilla (default: 10x)"
+
+setting_upgrade_ratio_name: "Upgrade Cost Ratio"
+setting_upgrade_ratio_desc: "Soul power cost per point of capacity increase (default: 100:1)"
+
+setting_upgrade_feature_name: "Enable Item Upgrades"
+setting_upgrade_feature_desc: "Allow spending soul power to permanently increase item enchantment capacity (can be unlocked via quest)"

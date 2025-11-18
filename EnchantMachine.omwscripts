@@ -1,0 +1,8 @@
+# Dwemer Enchanting Machine - OpenMW 0.49
+# Attaches global and player scripts for the enchanting machine system
+
+GLOBAL: scripts/enchantmachine/global.lua
+GLOBAL: scripts/enchantmachine/debug.lua
+GLOBAL: scripts/enchantmachine/spawn_researcher.lua
+PLAYER: scripts/enchantmachine/player_full.lua
+CUSTOM: scripts/enchantmachine/machine.lua

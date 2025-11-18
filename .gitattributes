@@ -1,0 +1,10 @@
+# Linguist language detection for GitHub
+*.lua linguist-language=Lua
+*.omwscripts linguist-language=INI
+*.omwaddon binary
+
+# Documentation
+*.md linguist-documentation
+
+# Localization
+l10n/** linguist-vendored=false
