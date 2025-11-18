@@ -1,30 +1,40 @@
 # Dwemer Enchanting Machine
 
-A powerful OpenMW mod that adds advanced enchanting capabilities through a Dwemer-crafted machine.
+A powerful OpenMW mod that enables vastly more powerful enchanted items through a mysterious Dwemer artifact.
+
+## What This Mod Does
+
+Defeat a unique boss to obtain an ancient **Dwemer puzzle box** that lets you:
+1. **Bank soul power** from filled soul gems
+2. **Recharge enchanted items** anywhere, anytime
+3. **Upgrade unenchanted items** to have massively increased enchantment capacity
+4. Then use **normal Morrowind enchanters** to create incredibly powerful enchantments!
+
+The result: Create enchanted items with 10x, 50x, or even 100x the normal capacity - limited only by your soul power reserves.
 
 ## Features
 
-### Implemented ✅
-- **Story-Driven Discovery**: Unique boss encounter in vanilla Dwemer ruins to obtain the Remote
-- **Remote Control Item**: Use an in-game scroll to open the machine menu (no console commands!)
+### Core System ✅
+- **Story-Driven Discovery**: Defeat a unique boss encounter in vanilla Dwemer ruins to obtain the Remote
+- **Remote Control Device**: Ancient Dwemer puzzle box that opens the machine interface from anywhere
 - **Soul Power Bank**: Deposit filled soul gems to extract and store their soul power globally
-- **Soul Gem Consumption**: Deposited soul gems are consumed (removed from inventory)
-- **Recharge System**: Restore charges to enchanted items using stored soul power (1:1 ratio)
-- **Item Capacity Upgrades**: Permanently increase item enchantment capacity (configurable ratio, default 100:1)
-  - Creates new item records with higher enchantment capacity
-  - Supports multiple upgrades on the same item
-  - Only works on unenchanted items (upgrade before enchanting!)
-- **Persistent Storage**: Soul power and upgrades persist across game sessions via save files
-- **Enhanced UI**: Clean, Morrowind-styled interface with ESC key support
-- **Configurable Settings**: Adjust power multipliers and upgrade costs in mod settings
-- **Localization Support**: Built-in English localization (easy to extend to other languages)
-- **Comprehensive Validation**: Smart error handling and item type checking
-- **Unique Boss Encounter**: One-time boss fight against the Master Dwemer Researcher and guards
-- **No ESP Required**: Pure Lua implementation, works as a standalone mod
+- **Item Recharge**: Restore charges to enchanted items using stored soul power (1:1 ratio)
+- **Enhanced Enchanting**: Permanently increase item enchantment capacity before enchanting
+  - Upgrade unenchanted items to have much higher capacity (configurable, default 100:1 soul power cost)
+  - Then enchant them normally at any enchanter for vastly more powerful enchantments
+  - Stack multiple upgrades on the same item for extreme capacity
+  - Works with vanilla enchanting mechanics - no API limitations!
 
-### Planned (Coming Soon)
-- **Enhanced Enchanting**: Create custom enchantments with 10x vanilla capacity (configurable)
-- **Quest Integration**: Unlock upgrade feature through in-game quests instead of settings
+### Technical Features ✅
+- **No ESP Required**: Pure Lua + omwaddon implementation
+- **Save/Load Persistent**: All data properly tied to save files
+- **Clean UI**: Morrowind-styled interface with ESC key support
+- **Fully Configurable**: Adjust upgrade costs and ratios in mod settings
+- **Item Validation**: Smart error handling and type checking
+- **Localization Ready**: Built-in English, easy to extend
+
+### Future Plans
+- **Quest Integration**: Unlock upgrade feature through in-game quests instead of settings toggle
 
 ## Requirements
 
@@ -66,9 +76,9 @@ A powerful OpenMW mod that adds advanced enchanting capabilities through a Dweme
    - 1x Steam Centurion (Level 30)
    - **Difficulty: VERY HARD** (recommended level 10+)
 
-6. **Defeat the Master Researcher** and loot the **Remote Control scroll**
+6. **Defeat the Master Researcher** and loot the **Remote Control** (Dwemer puzzle box)
 
-7. **Use the Remote** from your inventory to open the machine menu!
+7. **Use the Remote** from your inventory to open the machine menu anywhere!
 
 See `STORY_DISCOVERY.md` for alternative spawn locations and detailed instructions.
 
@@ -78,40 +88,58 @@ If you want to start using the machine immediately, you can spawn the remote wit
 
 ### Using the Machine
 
-1. **Use the Remote Control scroll** from your inventory (looks like "Windwalker")
-2. The main menu will appear with options:
-   - **Deposit Soul Gems**: Select filled soul gems from your inventory to deposit
-   - **Recharge Item**: Restore charges to enchanted items (costs 1 soul power per charge point)
-   - **Upgrade Item Capacity**: Permanently increase unenchanted item capacity (requires feature enabled in settings)
-   - **Enchant Item** (coming soon): Create powerful enchantments
+1. **Use the Remote Control** (Dwemer puzzle box) from your inventory
+2. The ancient machine interface appears with options:
+   - **Deposit Soul Gems**: Convert filled soul gems into stored soul power
+   - **Recharge Item**: Restore charges to enchanted items (1 soul power per charge point)
+   - **Upgrade Item Capacity**: Permanently increase an unenchanted item's enchantment capacity
+3. **After upgrading an item**, visit any enchanter in Morrowind to create incredibly powerful enchantments!
 
-**Note**:
+**Important Notes**:
 - Press **ESC** to close any menu at any time
 - The Remote is **not consumed** when used - keep it forever!
-- Only **unenchanted** items can be upgraded (upgrade before enchanting!)
+- Only **unenchanted** items can be upgraded (always upgrade before enchanting!)
+- After upgrading, use **normal Morrowind enchanters** to create your powerful enchantments
+
+### Workflow Example
+
+1. Find/buy an unenchanted item you want to make powerful
+2. Use the Remote → Upgrade Item Capacity → Select item → Upgrade (costs soul power)
+3. Visit any enchanter (Balmora, Vivec, etc.) and enchant the upgraded item normally
+4. Enjoy your massively more powerful enchanted item!
 
 ### Settings
 
 Access mod settings in OpenMW under: **Settings → Scripts → Dwemer Enchanting Machine**
 
-- **Enable Machine**: Turn the system on/off
-- **Enchant Power Multiplier**: Set max enchantment value (1-100x, default: 10x)
+- **Enable Machine**: Turn the entire system on/off
 - **Upgrade Cost Ratio**: Soul power cost per capacity point (10-1000, default: 100:1)
-- **Enable Item Upgrades**: Toggle the upgrade feature (can be quest-locked)
+  - Lower = cheaper upgrades, higher = more expensive upgrades
+- **Enable Item Upgrades**: Toggle the upgrade feature (can be quest-locked in future)
 
 ## Technical Details
 
 ### Architecture
 
-- **global.lua**: Manages soul bank, settings, and data persistence
-- **machine.lua**: Local script for activator objects, handles activation
-- **player.lua**: Player script for UI and inventory interaction
+- **global.lua**: Manages soul bank, item upgrades, settings, and data persistence
+- **player_full.lua**: Player script for UI, inventory interaction, and remote control
+- **spawn_researcher.lua**: Boss encounter system
+- **debug.lua**: Debug and logging system
+
+### How Upgrades Work
+
+When you upgrade an item:
+1. Creates a **new item record** with increased `enchantCapacity` property
+2. Replaces the old item with the upgraded version in your inventory
+3. Preserves item condition and any existing charges
+4. Tracks the upgrade in save file (multiple upgrades stack)
+5. You can then enchant it normally at any enchanter for powerful results
 
 ### Data Storage
 
-- **Soul Power**: Stored globally, shared across all machines
-- **Upgraded Items**: Tracked by record ID in global storage
-- **Settings**: Persistent per-character storage
+- **Soul Power**: Stored per save file, shared globally
+- **Upgraded Items**: Tracked by record ID with base record mapping
+- **Settings**: Persistent per-character configuration
 
 ### API Interface
 
@@ -129,17 +157,15 @@ local value = machine.getSoulValue("golden saint")          -- Get soul value fr
 -- Item Operations
 local success, msg = machine.depositSoul(item, actor)       -- Deposit soul gem
 local success, msg = machine.rechargeItem(item, actor)      -- Recharge enchanted item
-local canEnchant, record = machine.canBeEnchanted(item)     -- Check if item can be enchanted
 local capacity = machine.getItemCapacity(item)              -- Get total capacity (base + upgrades)
-local effectiveCap = machine.getEffectiveEnchantCapacity(item)  -- Get capacity with multiplier
 
 -- Upgrade Operations
-local upgrade = machine.getUpgradedCapacity(itemRecordId)   -- Get upgrade for item type
-local success, msg = machine.upgradeItemCapacity(item, 50)  -- Upgrade item capacity
+local upgrade = machine.getUpgradedCapacity(itemRecordId)   -- Get current upgrade level
+local success, msg = machine.upgradeItemCapacity(item, amount, actor)  -- Upgrade by amount
 
 -- Settings
 local settings = machine.getSettings()                      -- Get all settings
--- settings.enableMachine, settings.enchantMultiplier, settings.upgradeRatio, settings.enableUpgradeFeature
+-- settings.enableMachine, settings.upgradeRatio, settings.enableUpgradeFeature
 ```
 
 ## Status
@@ -160,6 +186,8 @@ All core features are implemented and working:
 
 **Latest Update (v2.1.0 - 2025-01-12):**
 - ✨ Fixed remote control item - now properly opens menu from inventory
+- ✨ Remote uses Dwemer puzzle box mesh and visuals
+- ✨ Enhanced enchanting achieved through capacity upgrades + vanilla enchanters
 - ✨ Improved atmospheric messages and UI feedback
 - ✨ Cleaned up codebase and removed development artifacts
 
@@ -167,12 +195,16 @@ All core features are implemented and working:
 
 See **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)** for API documentation and extension guides.
 
-## Known Issues
+## How It Works
 
-- **Enhanced enchanting not implemented**: OpenMW Lua API doesn't support runtime enchantment creation. See [ENCHANTING_LIMITATION.md](ENCHANTING_LIMITATION.md) for details and potential workarounds.
-- **Quest integration**: Currently uses settings toggle. In-game quest system planned for future update.
+The mod achieves "enhanced enchanting" by **increasing item capacity before you enchant them**:
 
-All other features are fully functional and production-ready.
+1. The machine upgrades an unenchanted item's enchantment capacity
+2. You then use **normal Morrowind enchanting** (at any enchanter NPC)
+3. The vanilla game lets you create much more powerful enchantments due to the increased capacity
+4. Result: Massively more powerful enchanted items without needing runtime enchantment creation!
+
+This approach works perfectly with vanilla mechanics and has no API limitations. See [ENCHANTING_LIMITATION.md](ENCHANTING_LIMITATION.md) for technical details.
 
 ## Compatibility
 
