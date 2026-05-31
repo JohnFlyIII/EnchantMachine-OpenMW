@@ -87,8 +87,9 @@ local function log(level, category, message, data)
     end
 end
 
--- Convenience logging functions
-local function error(category, message, data)
+-- Convenience logging functions (named logError internally to avoid shadowing
+-- Lua's built-in error(); exported on the interface as `error`).
+local function logError(category, message, data)
     log(LOG_LEVELS.ERROR, category, message, data)
 end
 
@@ -141,7 +142,7 @@ local function recordError(category, errorMessage, context)
     metrics.errors = errors
     debugData:set('metrics', metrics)
 
-    error(category, errorMessage, context)
+    logError(category, errorMessage, context)
 end
 
 -- Performance tracking
@@ -356,7 +357,7 @@ return {
     interfaceName = 'EnchantMachineDebug',
     interface = {
         -- Logging
-        error = error,
+        error = logError,
         warn = warn,
         info = info,
         debug = debug,

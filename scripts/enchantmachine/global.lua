@@ -7,16 +7,81 @@ local types = require('openmw.types')
 local world = require('openmw.world')
 local I = require('openmw.interfaces')
 
--- Debug system reference (will be available after debug.lua loads)
-local function getDebug()
-    -- Access debug interface via I.EnchantMachineDebug
-    return I.EnchantMachineDebug
+-- Forwarding wrapper for the optional debug interface. Methods become no-ops
+-- when debug.lua hasn't loaded yet (or doesn't expose the requested method),
+-- so callers can write `dbg.info("Cat", "msg")` without a `if debug then` guard.
+local dbg = setmetatable({}, {
+    __index = function(_, method)
+        return function(...)
+            local d = I.EnchantMachineDebug
+            if d and d[method] then return d[method](...) end
+        end
+    end,
+})
+
+-- For a Weapon/Armor/Clothing instance, returns (record, itemData, typeModule).
+-- Returns nil for everything else. The typeModule (e.g. types.Weapon) is handy
+-- when the caller needs to call typeModule.records[id] or createRecordDraft.
+local function getEnchantable(item)
+    if types.Weapon.objectIsInstance(item) then
+        return types.Weapon.record(item), types.Weapon.itemData(item), types.Weapon
+    elseif types.Armor.objectIsInstance(item) then
+        return types.Armor.record(item), types.Armor.itemData(item), types.Armor
+    elseif types.Clothing.objectIsInstance(item) then
+        return types.Clothing.record(item), types.Clothing.itemData(item), types.Clothing
+    end
+end
+
+-- The name used to identify the enchanting machine remote control.
+-- We match by name (not recordId) because world.createRecord auto-generates IDs.
+local REMOTE_ITEM_NAME = "Dwemer Enchanting Machine Remote"
+
+-- Create a fresh remote item instance via a derived record.
+-- Used by both the boss-loot path and the debug GiveRemote event.
+local function createRemoteItem()
+    local template = types.Miscellaneous.records["misc_dwrv_artifact00"]
+        or types.Miscellaneous.records["misc_de_glass_green_01"]
+    if not template then
+        return nil, "No suitable template item found"
+    end
+
+    local draft = types.Miscellaneous.createRecordDraft({
+        template = template,
+        name = REMOTE_ITEM_NAME,
+        weight = 0.5,
+        value = 500,
+    })
+    local record = world.createRecord(draft)
+    return world.createObject(record.id, 1)
+end
+
+-- Id of the looted Dwemer scroll (the encoded book) that starts EM_DwemerDiscovery.
+-- The record lives in EnchantMachine.omwaddon, so — unlike the remote, which is a
+-- renamed misc item built via createRecordDraft — we instantiate it directly.
+local DWEMER_SCROLL_ENCODED_ID = "em_dwemer_scroll_encoded"
+
+-- Create a fresh encoded-scroll instance. Returns (object) or (nil, err) if the
+-- omwaddon record is missing (e.g. plugin not loaded / id changed in CS).
+local function createDwemerScroll()
+    if not types.Book.records[DWEMER_SCROLL_ENCODED_ID] then
+        return nil, "Scroll record '" .. DWEMER_SCROLL_ENCODED_ID .. "' missing — is EnchantMachine.omwaddon loaded?"
+    end
+    return world.createObject(DWEMER_SCROLL_ENCODED_ID, 1)
 end
 
 -- In-memory data (saved/loaded with save file)
 local soulPower = 0
 local upgradedItems = {}
 local itemBaseRecords = {}  -- Maps upgraded item ID -> original base record ID
+
+-- Upgrade tracking (declared early so getItemCapacity / upgradeItemCapacity can both use them)
+local function getUpgradedCapacity(itemRecordId)
+    return upgradedItems[itemRecordId] or 0
+end
+
+local function setUpgradedCapacity(itemRecordId, additionalCapacity)
+    upgradedItems[itemRecordId] = additionalCapacity
+end
 
 -- Shared storage for PLAYER script to read (just a display cache)
 local sharedData = storage.globalSection('EnchantMachine_SharedData')
@@ -57,15 +122,6 @@ local function getSettings()
     }
 end
 
--- Helper function to update a setting (deprecated - use settings UI instead)
-local function setSetting(key, value)
-    local debug = getDebug()
-    if debug then
-        debug.warn("Settings", "setSetting() is deprecated. Please use the settings UI: Options → Scripts → Dwemer Enchanting Machine")
-    end
-    return false, "Settings can only be changed through the UI (Options → Scripts → Dwemer Enchanting Machine)"
-end
-
 -- Get current soul power in the bank
 local function getSoulPower()
     return soulPower
@@ -75,8 +131,7 @@ end
 local function addSoulPower(amount)
     soulPower = soulPower + amount
     updateSharedData()
-    local debug = getDebug()
-    if debug then debug.info("SoulPower", "Added " .. amount .. ", total now: " .. soulPower) end
+    dbg.info("SoulPower", "Added " .. amount .. ", total now: " .. soulPower)
     return soulPower
 end
 
@@ -94,210 +149,113 @@ end
 local function resetSoulPower()
     soulPower = 0
     updateSharedData()
-    local debug = getDebug()
-    if debug then debug.info("SoulPower", "Soul power reset to 0") end
+    dbg.info("SoulPower", "Soul power reset to 0")
     return 0
 end
 
--- Get soul value from a creature record ID
+-- Get soul value from a creature record ID.
+-- Returns 0 if the record is missing or has no positive soulValue.
 local function getSoulValue(creatureId)
     if not creatureId or creatureId == "" then return 0 end
-
-    -- Use types.Creature.records to look up creature
-    local ok, record = pcall(function()
-        return types.Creature.records[creatureId]
-    end)
-
-    if ok and record then
-        -- Record is userdata, access soulValue directly
-        local soulOk, soulValue = pcall(function()
-            return record.soulValue
-        end)
-
-        if soulOk and soulValue and soulValue > 0 then
-            print(string.format("[EnchantMachine] Soul value for '%s': %d", creatureId, soulValue))
-            return soulValue
-        end
+    local record = types.Creature.records[creatureId]
+    local soulValue = record and record.soulValue or 0
+    if soulValue <= 0 then
+        dbg.warn("SoulValue", "No soul value for '" .. creatureId .. "'")
+        return 0
     end
-
-    print(string.format("[EnchantMachine] Could not get soul value for '%s', returning 0", creatureId))
-    return 0
+    return soulValue
 end
 
--- Check if an item can be enchanted
+-- Check if an item can be enchanted.
 local function canBeEnchanted(item)
     if not item then return false end
-
-    -- Check if it's a valid enchantable type
-    local isWeapon = types.Weapon.objectIsInstance(item)
-    local isArmor = types.Armor.objectIsInstance(item)
-    local isClothing = types.Clothing.objectIsInstance(item)
-
-    if not (isWeapon or isArmor or isClothing) then
+    local record = getEnchantable(item)
+    if not record then
         return false, "Only weapons, armor, and clothing can be enchanted"
     end
-
-    -- Get the record
-    local record
-    if isWeapon then
-        record = types.Weapon.record(item)
-    elseif isArmor then
-        record = types.Armor.record(item)
-    else
-        record = types.Clothing.record(item)
-    end
-
-    if not record then
-        return false, "Invalid item"
-    end
-
-    -- Check if item already has an enchantment
     if record.enchant and record.enchant ~= "" then
         return false, "Item is already enchanted"
     end
-
-    -- Check if item has enchant capacity
     if not record.enchantCapacity or record.enchantCapacity <= 0 then
         return false, "Item cannot hold enchantments"
     end
-
     return true, record
 end
 
--- Get item's enchantment capacity (including upgrades)
+-- Get item's enchantment capacity.
+-- Upgrades are baked into the derived record's enchantCapacity at creation time,
+-- so reading record.enchantCapacity already reflects any upgrade.
 local function getItemCapacity(item)
-    local isWeapon = types.Weapon.objectIsInstance(item)
-    local isArmor = types.Armor.objectIsInstance(item)
-    local isClothing = types.Clothing.objectIsInstance(item)
-
-    if not (isWeapon or isArmor or isClothing) then
-        return 0
-    end
-
-    local record
-    if isWeapon then
-        record = types.Weapon.record(item)
-    elseif isArmor then
-        record = types.Armor.record(item)
-    else
-        record = types.Clothing.record(item)
-    end
-
-    if not record then return 0 end
-
-    local baseCapacity = record.enchantCapacity or 0
-    local upgrade = getUpgradedCapacity(item.recordId)
-
-    return baseCapacity + upgrade
+    local record = getEnchantable(item)
+    return (record and record.enchantCapacity) or 0
 end
 
 -- Deposit soul from a soul gem (consumes the item)
 local function depositSoul(item, actor, settings)
-    local debug = getDebug()
-    if debug then debug.startTimer("depositSoul") end
+    dbg.startTimer("depositSoul")
 
     settings = settings or getSettings()
     if not settings.enableMachine then
-        if debug then
-            debug.warn("Deposit", "Machine is disabled")
-            debug.endTimer("depositSoul")
-        end
+        dbg.warn("Deposit", "Machine is disabled")
+        dbg.endTimer("depositSoul")
         return false, "Machine is disabled"
     end
 
     if not types.Miscellaneous.objectIsInstance(item) then
-        if debug then
-            debug.warn("Deposit", "Invalid item type")
-            debug.endTimer("depositSoul")
-        end
+        dbg.warn("Deposit", "Invalid item type")
+        dbg.endTimer("depositSoul")
         return false, "Not a soul gem"
     end
 
     local itemData = types.Miscellaneous.itemData(item)
     if not itemData or not itemData.soul then
-        if debug then
-            debug.warn("Deposit", "No soul in gem")
-            debug.endTimer("depositSoul")
-        end
+        dbg.warn("Deposit", "No soul in gem")
+        dbg.endTimer("depositSoul")
         return false, "No soul in this item"
     end
 
     local soulValue = getSoulValue(itemData.soul)
     if soulValue <= 0 then
-        if debug then
-            debug.error("Deposit", "Invalid soul value", soulValue)
-            debug.endTimer("depositSoul")
-        end
+        dbg.error("Deposit", "Invalid soul value", soulValue)
+        dbg.endTimer("depositSoul")
         return false, "Invalid soul"
     end
 
-    -- Remove the soul gem from inventory
-    item:remove()
-
-    -- Add soul power to bank
+    -- Consume a single gem from the stack. Without the count, remove() takes the
+    -- whole stack while we'd only credit one gem's soul value.
+    item:remove(1)
     local newTotal = addSoulPower(soulValue)
 
-    if debug then
-        debug.info("Deposit", "Deposited " .. soulValue .. " soul power")
-        debug.incrementMetric("totalDeposits")
-        debug.trackMetric("totalSoulPowerAdded", soulValue)
-        debug.endTimer("depositSoul")
-    end
+    dbg.info("Deposit", "Deposited " .. soulValue .. " soul power")
+    dbg.incrementMetric("totalDeposits")
+    dbg.trackMetric("totalSoulPowerAdded", soulValue)
+    dbg.endTimer("depositSoul")
 
     return true, "Deposited " .. soulValue .. " soul power. Total: " .. newTotal
 end
 
 -- Recharge an enchanted item using soul power
 local function rechargeItem(item, actor, settings)
-    local debug = getDebug()
-    if debug then debug.startTimer("rechargeItem") end
+    dbg.startTimer("rechargeItem")
 
     settings = settings or getSettings()
     if not settings.enableMachine then
-        if debug then
-            debug.warn("Recharge", "Machine is disabled")
-            debug.endTimer("rechargeItem")
-        end
+        dbg.warn("Recharge", "Machine is disabled")
+        dbg.endTimer("rechargeItem")
         return false, "Machine is disabled"
     end
 
-    -- Check if it's an enchantable item type
-    local isWeapon = types.Weapon.objectIsInstance(item)
-    local isArmor = types.Armor.objectIsInstance(item)
-    local isClothing = types.Clothing.objectIsInstance(item)
-
-    if not (isWeapon or isArmor or isClothing) then
+    local record, itemData = getEnchantable(item)
+    if not record then
         return false, "This item cannot be recharged"
     end
-
-    -- Get the record
-    local record
-    if isWeapon then
-        record = types.Weapon.record(item)
-    elseif isArmor then
-        record = types.Armor.record(item)
-    else
-        record = types.Clothing.record(item)
-    end
-
-    if not record or not record.enchant or record.enchant == "" then
+    if not record.enchant or record.enchant == "" then
         return false, "Item is not enchanted"
     end
 
-    -- Get enchantment data
     local enchantment = core.magic.enchantments.records[record.enchant]
     if not enchantment then
         return false, "Invalid enchantment"
-    end
-
-    -- Get item data to check current charge
-    local itemData
-    if isWeapon then
-        itemData = types.Weapon.itemData(item)
-    elseif isArmor then
-        itemData = types.Armor.itemData(item)
-    else
-        itemData = types.Clothing.itemData(item)
     end
 
     local maxCharge = enchantment.charge or 0
@@ -307,232 +265,105 @@ local function rechargeItem(item, actor, settings)
         return false, "Item is already fully charged (" .. math.floor(currentCharge) .. "/" .. math.floor(maxCharge) .. ")"
     end
 
-    local chargeNeeded = maxCharge - currentCharge
-    local soulPowerNeeded = math.ceil(chargeNeeded) -- 1:1 ratio for recharging
-
-    -- Check if we have enough soul power
+    local soulPowerNeeded = math.ceil(maxCharge - currentCharge) -- 1:1 ratio
     local success, remaining = subtractSoulPower(soulPowerNeeded)
     if not success then
         return false, "Not enough soul power (need " .. soulPowerNeeded .. ", have " .. remaining .. ")"
     end
 
-    -- Recharge the item
     if not itemData then
-        if debug then
-            debug.error("Recharge", "Item has no itemData - cannot set charge")
-            debug.endTimer("rechargeItem")
-        end
+        dbg.error("Recharge", "Item has no itemData - cannot set charge")
+        dbg.endTimer("rechargeItem")
         return false, "Item cannot store charge data"
     end
 
     itemData.enchantmentCharge = maxCharge
 
-    if debug then
-        debug.info("Recharge", "Recharged item using " .. soulPowerNeeded .. " soul power")
-        debug.incrementMetric("totalRecharges")
-        debug.trackMetric("totalSoulPowerSpent", soulPowerNeeded)
-        debug.endTimer("rechargeItem")
-    end
+    dbg.info("Recharge", "Recharged item using " .. soulPowerNeeded .. " soul power")
+    dbg.incrementMetric("totalRecharges")
+    dbg.trackMetric("totalSoulPowerSpent", soulPowerNeeded)
+    dbg.endTimer("rechargeItem")
 
     return true, "Recharged to " .. math.floor(maxCharge) .. "/" .. math.floor(maxCharge) .. ". Soul power remaining: " .. remaining
 end
 
--- Get upgraded capacity for an item
-local function getUpgradedCapacity(itemRecordId)
-    return upgradedItems[itemRecordId] or 0
-end
-
--- Set upgraded capacity for an item
-local function setUpgradedCapacity(itemRecordId, additionalCapacity)
-    upgradedItems[itemRecordId] = additionalCapacity
-end
-
--- Upgrade an item's enchantment capacity (FUNCTIONAL - creates new record)
+-- Upgrade an item's enchantment capacity by registering a new derived record
+-- and swapping the inventory item to it.
 local function upgradeItemCapacity(item, capacityIncrease, actor, settings)
-    local debug = getDebug()
-    if debug then debug.startTimer("upgradeItemCapacity") end
+    dbg.startTimer("upgradeItemCapacity")
 
     settings = settings or getSettings()
     if not settings.enableUpgradeFeature then
-        if debug then debug.endTimer("upgradeItemCapacity") end
+        dbg.endTimer("upgradeItemCapacity")
         return false, "Upgrade feature is not unlocked"
     end
 
     if capacityIncrease <= 0 then
-        if debug then debug.endTimer("upgradeItemCapacity") end
+        dbg.endTimer("upgradeItemCapacity")
         return false, "Increase must be positive"
     end
 
-    -- Validate item type
-    if not (types.Weapon.objectIsInstance(item) or types.Armor.objectIsInstance(item) or types.Clothing.objectIsInstance(item)) then
-        if debug then debug.endTimer("upgradeItemCapacity") end
+    local record, _oldData, typeMod = getEnchantable(item)
+    if not record then
+        dbg.endTimer("upgradeItemCapacity")
         return false, "Only weapons, armor, and clothing can be upgraded"
     end
-
-    -- Get record
-    local record
-    if types.Weapon.objectIsInstance(item) then
-        record = types.Weapon.record(item)
-    elseif types.Armor.objectIsInstance(item) then
-        record = types.Armor.record(item)
-    else
-        record = types.Clothing.record(item)
-    end
-
-    if not record or not record.enchantCapacity or record.enchantCapacity <= 0 then
-        if debug then debug.endTimer("upgradeItemCapacity") end
+    if not record.enchantCapacity or record.enchantCapacity <= 0 then
+        dbg.endTimer("upgradeItemCapacity")
         return false, "Item cannot hold enchantments"
     end
-
-    -- Check if item is already enchanted (CRITICAL: can't upgrade enchanted items)
     if record.enchant and record.enchant ~= "" then
-        if debug then debug.endTimer("upgradeItemCapacity") end
+        dbg.endTimer("upgradeItemCapacity")
         return false, "Cannot upgrade enchanted items. Only unenchanted items can be upgraded."
     end
 
-    -- Calculate cost
     local ratio = settings.upgradeRatio or 100
     local soulCost = capacityIncrease * ratio
-
-    -- Check and deduct soul power
     local success, newTotal = subtractSoulPower(soulCost)
     if not success then
-        if debug then debug.endTimer("upgradeItemCapacity") end
+        dbg.endTimer("upgradeItemCapacity")
         return false, "Not enough soul power (need " .. soulCost .. ", have " .. newTotal .. ")"
     end
 
-    -- Get the base record ID (original unupgraded item)
-    -- First check if we have a stored mapping (for generated IDs)
+    -- Walk back to the original base record. The pattern-match fallback handles
+    -- items from older save formats that pre-date itemBaseRecords.
     local baseRecordId = itemBaseRecords[item.recordId]
+        or item.recordId:match("^(.-)_cap%d+$")
+        or item.recordId
 
-    -- If not found, try pattern matching (for _cap### IDs)
-    if not baseRecordId then
-        baseRecordId = item.recordId:match("^(.-)_cap%d+$")
-    end
-
-    -- If still not found, this is the base item
-    if not baseRecordId then
-        baseRecordId = item.recordId
-    end
-
-    -- Get total upgrade amount for this base item
+    local baseRecord = typeMod.records[baseRecordId]
+    local baseCapacity = baseRecord.enchantCapacity
     local currentUpgrade = getUpgradedCapacity(baseRecordId)
-
-    -- Get original base capacity (from the base record, not current item)
-    local baseCapacity
-    if types.Weapon.objectIsInstance(item) then
-        local baseRecord = types.Weapon.records[baseRecordId]
-        baseCapacity = baseRecord.enchantCapacity
-    elseif types.Armor.objectIsInstance(item) then
-        local baseRecord = types.Armor.records[baseRecordId]
-        baseCapacity = baseRecord.enchantCapacity
-    else
-        local baseRecord = types.Clothing.records[baseRecordId]
-        baseCapacity = baseRecord.enchantCapacity
-    end
-
-    -- Calculate new capacity: original base + previous upgrades + new upgrade
     local newCapacity = baseCapacity + currentUpgrade + capacityIncrease
 
-    -- Generate unique record ID based on BASE record, not current item
-    local newRecordId = baseRecordId .. "_cap" .. math.floor(newCapacity)
+    -- world.createRecord auto-generates the id (the draft.id field is ignored),
+    -- so we always register a fresh record and trust the returned id.
+    local draft = typeMod.createRecordDraft({ template = record, enchantCapacity = newCapacity })
+    local newRecordId = world.createRecord(draft).id
+    itemBaseRecords[newRecordId] = baseRecordId
 
-    -- Check if record already exists
-    local recordExists = false
-    local checkOk, existingRecord = pcall(function()
-        if types.Weapon.objectIsInstance(item) then
-            return types.Weapon.records[newRecordId]
-        elseif types.Armor.objectIsInstance(item) then
-            return types.Armor.records[newRecordId]
-        else
-            return types.Clothing.records[newRecordId]
-        end
-    end)
-
-    recordExists = checkOk and existingRecord ~= nil
-
-    -- Create new record if it doesn't exist
-    if not recordExists then
-        if debug then debug.info("Upgrade", "Creating new record: " .. newRecordId) end
-
-        local draft
-        if types.Weapon.objectIsInstance(item) then
-            draft = types.Weapon.createRecordDraft({
-                template = record,
-                id = newRecordId,
-                enchantCapacity = newCapacity,
-            })
-        elseif types.Armor.objectIsInstance(item) then
-            draft = types.Armor.createRecordDraft({
-                template = record,
-                id = newRecordId,
-                enchantCapacity = newCapacity,
-            })
-        else -- Clothing
-            draft = types.Clothing.createRecordDraft({
-                template = record,
-                id = newRecordId,
-                enchantCapacity = newCapacity,
-            })
-        end
-
-        -- Register the new record in the world database
-        local createdRecord = world.createRecord(draft)
-
-        -- Get the actual ID from the created record (might be modified by engine)
-        newRecordId = createdRecord.id
-
-        -- Store mapping from generated ID -> base record ID (for future upgrades)
-        itemBaseRecords[newRecordId] = baseRecordId
-
-        if debug then debug.info("Upgrade", "Created record with capacity " .. newCapacity .. ", ID: " .. newRecordId .. " -> base: " .. baseRecordId) end
-    end
-
-    -- Create new item instance from upgraded record (use ID string)
     local newItem = world.createObject(newRecordId, 1)
 
-    -- Copy item data from old to new
-    local oldData, newData
-
-    if types.Weapon.objectIsInstance(item) then
-        oldData = types.Weapon.itemData(item)
-        newData = types.Weapon.itemData(newItem)
-    elseif types.Armor.objectIsInstance(item) then
-        oldData = types.Armor.itemData(item)
-        newData = types.Armor.itemData(newItem)
-    else
-        oldData = types.Clothing.itemData(item)
-        newData = types.Clothing.itemData(newItem)
-    end
-
-    -- Copy condition and charges if they exist
+    -- Carry over condition and remaining enchant charge.
+    local oldData = typeMod.itemData(item)
+    local newData = typeMod.itemData(newItem)
     if oldData and newData then
-        if oldData.condition then
-            newData.condition = oldData.condition
-        end
-        if oldData.enchantmentCharge then
-            newData.enchantmentCharge = oldData.enchantmentCharge
-        end
+        if oldData.condition then newData.condition = oldData.condition end
+        if oldData.enchantmentCharge then newData.enchantmentCharge = oldData.enchantmentCharge end
     end
 
-    -- Add new item to actor's inventory
     if actor and types.Actor.objectIsInstance(actor) then
         newItem:moveInto(types.Actor.inventory(actor))
     end
+    -- Consume one item from the stack; we only created one upgraded replacement.
+    item:remove(1)
 
-    -- Remove old item
-    item:remove()
-
-    -- Update tracking (store total upgrade amount for BASE record)
     setUpgradedCapacity(baseRecordId, newCapacity - baseCapacity)
 
-    if debug then
-        debug.info("Upgrade", "Upgraded " .. record.name .. " from base " .. baseCapacity .. " to " .. newCapacity .. " (base: " .. baseRecordId .. ")")
-        debug.incrementMetric("totalUpgrades")
-        debug.endTimer("upgradeItemCapacity")
-    end
+    dbg.info("Upgrade", "Upgraded " .. record.name .. " " .. baseCapacity .. " -> " .. newCapacity .. " (base " .. baseRecordId .. ")")
+    dbg.incrementMetric("totalUpgrades")
+    dbg.endTimer("upgradeItemCapacity")
 
-    -- Show current capacity -> new capacity in message (not base capacity)
     return true, "Upgraded " .. record.name .. " capacity from " .. math.floor(record.enchantCapacity) .. " to " .. math.floor(newCapacity) .. ". Soul power remaining: " .. math.floor(newTotal)
 end
 
@@ -544,48 +375,33 @@ local function getEffectiveEnchantCapacity(item)
     return baseCapacity * multiplier
 end
 
--- Helper function to register the remote item handler
--- Must be called from both onInit() and onLoad() to work with save games
+-- ItemUsage handlers don't persist across save/load — must be re-registered from
+-- both onInit() and onLoad() so the remote keeps working after loading a save.
+-- Handler signature per OpenMW API: handler(object, actor, options).
 local function registerRemoteHandler()
-    print("[EnchantMachine] Registering remote item handler for Misc items...")
-    I.ItemUsage.addHandlerForType(types.Miscellaneous, function(object, actor)
-        -- Check if this specific misc item is our remote control
-        if object.recordId == "enchant_machine_remote" then
+    I.ItemUsage.addHandlerForType(types.Miscellaneous, function(object, actor, _options)
+        local record = types.Miscellaneous.records[object.recordId]
+        local itemName = record and record.name or ""
+        if itemName == REMOTE_ITEM_NAME then
             if types.Player.objectIsInstance(actor) then
-                print("[EnchantMachine] Remote item used, opening menu...")
                 actor:sendEvent('EnchantMachine_OpenMenu', {})
             end
-            return false  -- Don't consume the item, block other handlers
+            return false  -- Skip subsequent handlers and the standard use action
         end
-        -- Not our item, let other handlers process it
         return nil
     end)
-    print("[EnchantMachine] Remote item handler registered for Misc type")
 end
 
--- Event handlers
 local function onInit()
-    print("[EnchantMachine] Global script initializing...")
-
-    -- Initialize shared storage for PLAYER script to read
     updateSharedData()
-
-    -- Register remote control item handler
-    local ok, err = pcall(registerRemoteHandler)
-    if ok then
-        print("[EnchantMachine] Global script initialized successfully")
-        print("[EnchantMachine] Soul power: " .. soulPower)
-    else
-        print("[EnchantMachine] ERROR registering handler: " .. tostring(err))
-    end
+    registerRemoteHandler()
+    dbg.info("Init", "Initialized with soul power " .. soulPower)
 end
 
 local function onSave()
-    local debug = getDebug()
-    if debug then debug.info("Save", "Saving soul power: " .. soulPower) end
-
+    dbg.info("Save", "Saving soul power: " .. soulPower)
     return {
-        version = 2,  -- Increment version for itemBaseRecords support
+        version = 2,
         soulPower = soulPower,
         upgradedItems = upgradedItems,
         itemBaseRecords = itemBaseRecords,
@@ -593,124 +409,64 @@ local function onSave()
 end
 
 local function onLoad(data)
-    local debug = getDebug()
-
     if data and data.version then
-        -- Restore soul power from save file
         soulPower = data.soulPower or 0
         upgradedItems = data.upgradedItems or {}
         itemBaseRecords = data.itemBaseRecords or {}
-
-        if debug then debug.info("Load", "Loaded soul power: " .. soulPower .. ", base record mappings: " .. tostring(#itemBaseRecords)) end
+        dbg.info("Load", "Loaded soul power " .. soulPower)
     else
-        -- New game or old save without our data
         soulPower = 0
         upgradedItems = {}
         itemBaseRecords = {}
-
-        if debug then debug.info("Load", "New game, starting with 0 soul power") end
+        dbg.info("Load", "New game, starting at 0 soul power")
     end
 
-    -- Sync to shared storage so PLAYER script can read it
     updateSharedData()
 
-    -- CRITICAL: Register the remote item handler when loading saves
-    -- ItemUsage handlers don't persist across save/load, must re-register each time
-    print("[EnchantMachine] Registering handler after loading save...")
-    local ok, err = pcall(registerRemoteHandler)
-    if not ok then
-        print("[EnchantMachine] ERROR registering handler: " .. tostring(err))
-    end
+    -- ItemUsage handlers don't persist across save/load — re-register each time.
+    registerRemoteHandler()
 end
 
--- Event handlers for cross-context communication
-local function onDepositGemEvent(eventData)
-    local debug = getDebug()
-    if debug then debug.info("Event", "Received DepositGem event") end
+-- Dispatch an operation event: validates actor+item, runs op, replies with result.
+-- `op` receives (item, actor, settings) and returns (success, message).
+local function handleOperationEvent(name, op, eventData)
+    dbg.info("Event", "Received " .. name)
 
     local actor = eventData.actor
     local item = eventData.item
-    local settings = eventData.settings or getSettings()  -- Use settings from event, fallback to storage
-
     if not actor or not item then
-        if debug then debug.error("Event", "Missing actor or item in DepositGem event") end
+        dbg.error("Event", "Missing actor or item in " .. name)
         if actor then
             actor:sendEvent('EnchantMachine_Result', {
                 success = false,
-                message = "Invalid deposit request"
+                message = "Invalid " .. name .. " request",
             })
         end
         return
     end
 
-    local success, message = depositSoul(item, actor, settings)
+    local settings = eventData.settings or getSettings()
+    local success, message = op(item, actor, settings, eventData)
 
-    -- Send result back to player
     actor:sendEvent('EnchantMachine_Result', {
         success = success,
         message = message,
-        operation = 'deposit'
+        operation = name,
     })
+end
+
+local function onDepositGemEvent(eventData)
+    handleOperationEvent('deposit', depositSoul, eventData)
 end
 
 local function onRechargeItemEvent(eventData)
-    local debug = getDebug()
-    if debug then debug.info("Event", "Received RechargeItem event") end
-
-    local actor = eventData.actor
-    local item = eventData.item
-    local settings = eventData.settings or getSettings()  -- Use settings from event, fallback to storage
-
-    if not actor or not item then
-        if debug then debug.error("Event", "Missing actor or item in RechargeItem event") end
-        if actor then
-            actor:sendEvent('EnchantMachine_Result', {
-                success = false,
-                message = "Invalid recharge request"
-            })
-        end
-        return
-    end
-
-    local success, message = rechargeItem(item, actor, settings)
-
-    -- Send result back to player
-    actor:sendEvent('EnchantMachine_Result', {
-        success = success,
-        message = message,
-        operation = 'recharge'
-    })
+    handleOperationEvent('recharge', rechargeItem, eventData)
 end
 
 local function onUpgradeItemEvent(eventData)
-    local debug = getDebug()
-    if debug then debug.info("Event", "Received UpgradeItem event") end
-
-    local actor = eventData.actor
-    local item = eventData.item
-    local amount = eventData.amount or 1
-    local settings = eventData.settings or getSettings()  -- Use settings from event, fallback to storage
-
-    if not actor or not item then
-        if debug then debug.error("Event", "Missing actor or item in UpgradeItem event") end
-        if actor then
-            actor:sendEvent('EnchantMachine_Result', {
-                success = false,
-                message = "Invalid upgrade request"
-            })
-        end
-        return
-    end
-
-    -- Pass actor and settings to upgradeItemCapacity for inventory management
-    local success, message = upgradeItemCapacity(item, amount, actor, settings)
-
-    -- Send result back to player
-    actor:sendEvent('EnchantMachine_Result', {
-        success = success,
-        message = message,
-        operation = 'upgrade'
-    })
+    handleOperationEvent('upgrade', function(item, actor, settings, ev)
+        return upgradeItemCapacity(item, ev.amount or 1, actor, settings)
+    end, eventData)
 end
 
 -- Export interface for other scripts
@@ -727,6 +483,10 @@ return {
         -- Soul gem operations
         depositSoul = depositSoul,
 
+        -- Custom item creation
+        createRemoteItem = createRemoteItem,
+        createDwemerScroll = createDwemerScroll,
+
         -- Item operations
         rechargeItem = rechargeItem,
         canBeEnchanted = canBeEnchanted,
@@ -739,7 +499,6 @@ return {
 
         -- Settings access
         getSettings = getSettings,
-        setSetting = setSetting,
     },
     engineHandlers = {
         onInit = onInit,
@@ -750,5 +509,37 @@ return {
         EnchantMachine_DepositGem = onDepositGemEvent,
         EnchantMachine_RechargeItem = onRechargeItemEvent,
         EnchantMachine_UpgradeItem = onUpgradeItemEvent,
+
+        -- PLAYER pushes its current settings here so machine.getSettings() (the
+        -- documented public API) returns what the user actually configured,
+        -- rather than the default fallbacks.
+        EnchantMachine_SyncSettings = function(data)
+            if not data then return end
+            for _, key in ipairs({'enableMachine', 'enchantMultiplier', 'upgradeRatio', 'enableUpgradeFeature'}) do
+                if data[key] ~= nil then
+                    settingsData:set(key, data[key])
+                end
+            end
+        end,
+
+        -- Debug: spawn a remote into the player's inventory (callable from console).
+        EnchantMachine_GiveRemote = function(data)
+            local player = world.players[1]
+            if not player then return end
+            local remote, err = createRemoteItem()
+            if remote then
+                remote:moveInto(types.Actor.inventory(player))
+            else
+                print("[EnchantMachine] GiveRemote failed: " .. tostring(err))
+            end
+            -- Also hand over the Dwemer scroll so the dev flow exercises the full
+            -- loot (and the EM_DwemerDiscovery quest start).
+            local scroll, serr = createDwemerScroll()
+            if scroll then
+                scroll:moveInto(types.Actor.inventory(player))
+            else
+                print("[EnchantMachine] GiveScroll failed: " .. tostring(serr))
+            end
+        end,
     },
 }

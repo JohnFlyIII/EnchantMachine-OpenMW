@@ -1,135 +1,92 @@
-# Quick Start Guide - Dwemer Enchanting Machine
+# Quick Start Guide — Dwemer Enchanting Machine
 
-## 5-Minute Test Setup
+Get the mod running and tested in a few minutes.
 
-This guide gets you testing the mod in under 5 minutes.
+## Step 1: Install
 
-### Step 1: Verify Installation (30 seconds)
+Copy the `enchant-machine/` folder into your OpenMW data directory, then edit your `openmw.cfg`:
 
-Check that these files exist:
+```
+data="/path/to/enchant-machine"
+content=EnchantMachine.omwaddon
+lua-scripts=EnchantMachine.omwscripts
+```
+
+Required files:
+
 ```
 enchant-machine/
 ├── EnchantMachine.omwscripts
+├── EnchantMachine.omwaddon
 ├── l10n/EnchantMachine/en.lua
-└── scripts/EnchantMachine/
+└── scripts/enchantmachine/
     ├── global.lua
-    ├── player.lua
+    ├── player_full.lua
     ├── machine.lua
-    └── test_machine.lua
+    ├── debug.lua
+    └── spawn_researcher.lua
 ```
 
-### Step 2: Enable in OpenMW (1 minute)
+Requires OpenMW 0.49 or later.
 
-1. Open **OpenMW Launcher**
-2. Go to **Data Files** tab
-3. Make sure your data path includes: `enchant-machine`
-4. Edit `openmw.cfg` and add:
-   ```
-   data="/path/to/enchant-machine"
-   lua-scripts=EnchantMachine.omwscripts
-   ```
-5. Save and launch OpenMW
+## Step 2: Get the Remote
 
-### Step 3: Create Test Machine (2 minutes)
+**Story path:** load a save, travel to Arkngthand → Deep Ore Passage, defeat the Master Dwemer Researcher and his guards, then loot the **Dwemer Enchanting Machine Remote** from his body.
 
-**In-Game:**
-
-1. Load any save
-2. Press **F3** (open console)
-3. Type: `player->coc "balmora, guild of mages"`
-4. Look at any object (door, chest, etc.)
-5. Type: `"reference"->addscript "scripts/EnchantMachine/test_machine.lua"`
-6. Close console (**F3**)
-7. **Activate the object**
-
-You should see the machine menu!
-
-### Step 4: Get Test Items (1 minute)
-
-Press **F3** and run these commands:
+**Skip path (testing):** press F3 to open the console and run:
 
 ```
-em_give_gems          # Get soul gems
-em_add_souls 10000    # Get 10,000 soul power
-em_give_upgradeable   # Get items to upgrade
+luags lua sendGlobalEvent('EnchantMachine_GiveRemote', {})
 ```
 
-### Step 5: Test Features (1 minute)
+The remote appears in your inventory immediately.
 
-**Test Deposit:**
-1. Open machine
-2. Click "Deposit Soul Gems"
-3. Select a gem
-4. Watch your soul power increase!
+## Step 3: Use the Remote
 
-**Test Recharge:**
-1. Get enchanted item: `player->additem "glass dagger_enamor" 1`
-2. Use it a few times to drain charges
-3. Open machine → "Recharge Item"
-4. Select the dagger
-5. It's fully charged!
+1. Open your inventory.
+2. Double-click the **Dwemer Enchanting Machine Remote** (a small Dwemer artifact).
+3. The machine menu opens. The remote is **not consumed** — keep it.
 
-**Test Upgrade:**
-1. Go to **Settings → Scripts → Dwemer Enchanting Machine**
-2. Enable "Enable Item Upgrades"
-3. Open machine → "Upgrade Item Capacity"
-4. Select an item (e.g., "Exquisite Shirt")
-5. Choose "+10 capacity"
-6. Item capacity permanently increased!
+The menu offers:
+- **Deposit Soul Gems** — consume filled gems for soul power.
+- **Recharge Enchanted Items** — restore charges (1 power per charge point).
+- **Upgrade Item Capacity** — permanently raise an unenchanted item's `enchantCapacity` (locked behind a setting toggle).
 
-## Quick Commands Reference
+Press **ESC** to close any menu.
 
-| Command | What It Does |
-|---------|--------------|
-| `em_help` | Show all commands |
-| `em_status` | Show soul power and settings |
-| `em_give_gems` | Get filled soul gems |
-| `em_give_upgradeable` | Get test items |
-| `em_add_souls 10000` | Add 10k soul power |
+## Step 4: Try Each Feature
 
-## Keyboard Shortcuts
+**Deposit:**
+1. Make sure you have at least one filled soul gem.
+2. Remote → Deposit Soul Gems → click the gem.
 
-- **F3** - Open/close console
-- **F10** - Toggle console history (see detailed output)
-- **ESC** - Close machine menu
+**Recharge:**
+1. Use an enchanted item until its charge drops.
+2. Remote → Recharge Enchanted Items → click the item.
 
-## Common Issues
+**Upgrade:**
+1. Open Settings → Scripts → Dwemer Enchanting Machine and turn on **Enable Upgrades**.
+2. Pick an unenchanted weapon/armor/clothing item with non-zero enchant capacity.
+3. Remote → Upgrade Item Capacity → pick item → choose an amount.
+4. Take the upgraded item to any enchanter and enchant it normally — the higher capacity unlocks much stronger enchantments.
 
-**"No global script found"**
-→ Make sure `lua-scripts=EnchantMachine.omwscripts` is in openmw.cfg
+## Settings
 
-**Machine doesn't activate**
-→ Make sure you attached the script to an activator (not a static object)
+`Options → Scripts → Dwemer Enchanting Machine`
 
-**Settings not showing**
-→ Go to Settings → Scripts → Dwemer Enchanting Machine
+- **Enable Machine** — master on/off switch.
+- **Enchant Multiplier** — display hint (default 10x).
+- **Upgrade Ratio** — soul power per capacity point (default 100).
+- **Enable Upgrades** — gates the upgrade menu.
+- **Soul Power** — read-only display under the Status section.
 
-**"Machine is disabled"**
-→ Enable it in: Settings → Scripts → Dwemer Enchanting Machine → Enable Machine
+## Troubleshooting
 
-## Next Steps
+| Symptom | Check |
+|---|---|
+| Remote doesn't open a menu | Confirm `lua-scripts=EnchantMachine.omwscripts` is set; reload the save. |
+| Settings page missing | Confirm OpenMW 0.49+ and the `lua-scripts=` line. |
+| Boss didn't spawn | Look at the OpenMW log for `[EnchantMachine]` lines — the boss spawns when the player enters `Arkngthand, Deep Ore Passage`. |
+| "Machine is disabled" message | Toggle **Enable Machine** in Settings. |
 
-- See **[TESTING.md](TESTING.md)** for comprehensive testing guide
-- See **[README.md](README.md)** for full documentation
-- See **[CODE_REVIEW_SUMMARY.md](CODE_REVIEW_SUMMARY.md)** for technical details
-
-## Cleaning Up
-
-To remove the test machine:
-1. Select the object in console
-2. Type: `disable`
-3. Type: `markfordelete`
-
-To reset your test data:
-1. Delete storage files in:
-   - Windows: `%USERPROFILE%\Documents\My Games\OpenMW\storage\`
-   - Linux: `~/.local/share/openmw/storage/`
-2. Look for files with "EnchantMachine" in the name
-
-## Support
-
-If something doesn't work:
-1. Check OpenMW version (need 0.49+)
-2. Check console (F10) for error messages
-3. Run `em_status` to verify system state
-4. See **[TESTING.md](TESTING.md)** troubleshooting section
+For deeper debugging, see [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md). Logs and metrics are accessible via the `EnchantMachineDebug` interface from any GLOBAL script.

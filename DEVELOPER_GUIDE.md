@@ -1,198 +1,94 @@
-## Developer Guide - Dwemer Enchanting Machine
+## Developer Guide — Dwemer Enchanting Machine
 
-Comprehensive guide for developers working on or extending the Dwemer Enchanting Machine mod.
+Reference for developers extending or modifying the mod.
 
 ## Project Structure
 
 ```
 enchant-machine/
-├── EnchantMachine.omwscripts         # Script registration file
-├── README.md                          # User documentation
-├── QUICKSTART.md                      # 5-minute setup guide
-├── TESTING.md                         # Testing procedures
-├── CODE_REVIEW_SUMMARY.md            # Technical review
-├── ENCHANTING_LIMITATION.md          # API limitations explained
+├── EnchantMachine.omwscripts         # Script registration
+├── EnchantMachine.omwaddon           # Custom records (omwaddon)
+├── README.md                         # User documentation
+├── QUICKSTART.md                     # 5-minute setup guide
+├── ENCHANTING_LIMITATION.md          # Why upgrades work the way they do
+├── STORY_DISCOVERY.md                # Boss-encounter design notes
 ├── DEVELOPER_GUIDE.md                # This file
 ├── l10n/EnchantMachine/
-│   └── en.lua                         # Localization strings
-└── scripts/EnchantMachine/
-    ├── global.lua                     # Core business logic
-    ├── player.lua                     # UI and player interaction
-    ├── machine.lua                    # Activator script
-    ├── debug.lua                      # Debug and logging system
-    ├── test_suite.lua                 # Automated tests
-    ├── test_machine.lua               # Manual testing tools
-    ├── quest_example.lua              # Quest integration example
-    └── placement_helper.lua           # Placement utilities
+│   └── en.lua                        # Localization strings
+└── scripts/enchantmachine/
+    ├── global.lua                    # GLOBAL: soul-power, items, upgrades, settings store
+    ├── player_full.lua               # PLAYER: UI, settings page, input
+    ├── machine.lua                   # CUSTOM: activator-attached, forwards to player
+    ├── debug.lua                     # GLOBAL: logging, metrics, performance
+    └── spawn_researcher.lua          # GLOBAL: one-time boss encounter
 ```
 
 ## Architecture Overview
 
+OpenMW splits Lua execution into contexts. Each script in `EnchantMachine.omwscripts` runs in one of them:
+
+| Script               | Context | Loads via            |
+|----------------------|---------|----------------------|
+| `global.lua`         | GLOBAL  | `GLOBAL:` directive  |
+| `debug.lua`          | GLOBAL  | `GLOBAL:` directive  |
+| `spawn_researcher.lua` | GLOBAL | `GLOBAL:` directive |
+| `player_full.lua`    | PLAYER  | `PLAYER:` directive  |
+| `machine.lua`        | CUSTOM  | `CUSTOM:` directive, attached to activator objects |
+
+**Key constraint:** GLOBAL has world authority (`world.createRecord`, `world.createObject`, creature records). PLAYER has UI and input. Crossing contexts requires events — there's no shared mutable state. See `ENCHANTING_LIMITATION.md` for the deeper explanation of why upgrades must create derived records.
+
 ### Script Responsibilities
 
-#### global.lua (Core Logic)
-- **Purpose**: Business logic and data management
-- **Responsibilities**:
-  - Soul power management
-  - Item validation and operations
-  - Recharge functionality
-  - Upgrade system
-  - Settings access
-- **Interface**: Exports functions for other scripts
-- **Storage**: Uses `storage.globalSection('EnchantMachine_Data')`
+#### global.lua — Core logic
+- Soul-power bank (in-memory, persisted via `onSave`/`onLoad`).
+- Soul-gem deposit, item recharge, capacity upgrade.
+- Custom-record creation for upgraded items (`<base>_cap<N>` IDs).
+- Remote-control item handler registered via `I.ItemUsage.addHandlerForType`.
+- Exports the public `EnchantMachine` interface (see API Reference).
+- Receives `EnchantMachine_SyncSettings` events from PLAYER to keep its `getSettings()` consistent with the user-configured values.
 
-#### player.lua (UI Layer)
-- **Purpose**: User interface and player interaction
-- **Responsibilities**:
-  - Menu creation and management
-  - Inventory scanning
-  - User input handling
-  - Visual feedback
-- **Interface**: Receives events, displays UI
-- **Key Functions**: `createMainMenu()`, `showDepositMenu()`, etc.
+#### player_full.lua — UI and input
+- Registers the Settings page (`Options → Scripts → Dwemer Enchanting Machine`).
+- Reads soul power from `storage.globalSection('EnchantMachine_SharedData')` (write-cached by GLOBAL).
+- Builds menus via the local `createMenu{}` helper.
+- Sends operation events (`EnchantMachine_DepositGem`, `EnchantMachine_RechargeItem`, `EnchantMachine_UpgradeItem`) and waits for `EnchantMachine_Result` replies.
+- Detects entry into the boss cell and pings GLOBAL to spawn the encounter.
 
-#### machine.lua (Activator)
-- **Purpose**: Object activation handler
-- **Responsibilities**:
-  - Detect player activation
-  - Send event to player script
-- **Minimal**: Only 25 lines
+#### machine.lua — Activator handler
+Twenty-line script attached to in-world activator objects. Forwards activation to the player via `actor:sendEvent('EnchantMachine_OpenMenu', …)`.
 
-#### debug.lua (Development Support)
-- **Purpose**: Logging, metrics, and diagnostics
-- **Responsibilities**:
-  - Log management
-  - Performance tracking
-  - Metric collection
-  - System validation
-- **Interface**: Provides debug functions to all scripts
+#### debug.lua — Diagnostics
+Independent global script exposing `I.EnchantMachineDebug` with logging, metrics, performance timers, and reporting. All other scripts call it defensively via `local debug = getDebug()` since it loads in unspecified order.
 
-#### test_suite.lua (Quality Assurance)
-- **Purpose**: Automated testing
-- **Responsibilities**:
-  - Unit tests
-  - Integration tests
-  - Test reporting
-- **Console Command**: `em_test`
+#### spawn_researcher.lua — Boss encounter
+One-time spawn of the Master Dwemer Researcher + guards at a configured Dwemer-ruin location. Persists `bossSpawned` per save file. Has fallback creature-ID candidates for mod-conflict resilience.
 
-## Development Workflow
+## Storage Sections
 
-### 1. Setting Up Development Environment
+| Section                          | Owner   | Purpose                                  |
+|----------------------------------|---------|------------------------------------------|
+| `EnchantMachine_SharedData`      | GLOBAL  | Soul-power display cache for PLAYER UI.  |
+| `EnchantMachine_Settings`        | GLOBAL  | User settings (synced from PLAYER each tick). |
+| `EnchantMachine_Debug`           | GLOBAL  | `debug.lua` log buffer, metrics, perf.   |
+| `SettingsEnchantMachineConfig`   | PLAYER  | The real settings UI store (per-player). |
+| `SettingsEnchantMachineStatus`   | PLAYER  | Read-only soul-power line on settings page. |
 
-```bash
-# 1. Clone/download the mod
-cd /path/to/OpenMW/data/
+In-memory state (`soulPower`, `upgradedItems`, `itemBaseRecords`, `bossSpawned`, `bossSpawnRequested`) is persisted via each script's `onSave` / `onLoad`.
 
-# 2. Enable developer mode in OpenMW
-# Edit openmw.cfg:
-lua-scripts=EnchantMachine.omwscripts
+## Cross-Context Events
 
-# 3. Enable console
-# In-game: F3
-
-# 4. Hot reload after changes
-# Console: reloadlua
-```
-
-### 2. Making Changes
-
-**Workflow:**
-1. Edit Lua files
-2. Save changes
-3. In-game console: `reloadlua`
-4. Test changes
-5. Run automated tests: `em_test`
-
-**Tips:**
-- Use `debug.info()` liberally for logging
-- Check console (F10) for errors
-- Use `em_status` to verify state
-- Run `em_test` before committing
-
-### 3. Adding New Features
-
-**Step-by-step:**
-
-```lua
--- 1. Add function to global.lua
-local function myNewFeature(item, actor)
-    local debug = getDebug()
-    if debug then debug.startTimer("myNewFeature") end
-
-    -- Your logic here
-
-    if debug then
-        debug.info("MyFeature", "Feature executed")
-        debug.endTimer("myNewFeature")
-    end
-
-    return true, "Success message"
-end
-
--- 2. Export in interface
-return {
-    interface = {
-        myNewFeature = myNewFeature,
-        -- ... other functions
-    },
-}
-
--- 3. Add UI in player.lua
-local function showMyFeatureMenu()
-    -- Create UI elements
-end
-
--- 4. Add to main menu
-createButton("My Feature", function()
-    showMyFeatureMenu()
-end)
-
--- 5. Add test in test_suite.lua
-local function test_my_new_feature()
-    local machine = getMachine()
-    local result = machine.myNewFeature(testItem, testActor)
-    assert_true(result, "Feature should succeed")
-end
-
--- 6. Run tests
--- Console: em_test
-```
-
-### 4. Adding Localization
-
-**Add new strings:**
-
-```lua
--- l10n/EnchantMachine/en.lua
-return {
-    -- Existing strings...
-
-    my_feature_name = "My Feature",
-    my_feature_desc = "Description of my feature",
-}
-
--- In settings registration:
-{
-    key = 'myFeature',
-    name = 'my_feature_name',  -- References l10n
-    description = 'my_feature_desc',
-    -- ...
-}
-```
-
-**Add new language:**
-
-```lua
--- l10n/EnchantMachine/de.lua
-return {
-    my_feature_name = "Meine Funktion",
-    my_feature_desc = "Beschreibung meiner Funktion",
-}
-```
+| Event                            | Direction        | Purpose |
+|----------------------------------|------------------|---------|
+| `EnchantMachine_OpenMenu`        | GLOBAL → PLAYER  | Open the main menu (fired by remote item or activator). |
+| `EnchantMachine_DepositGem`      | PLAYER → GLOBAL  | Consume a soul gem, credit soul power.   |
+| `EnchantMachine_RechargeItem`    | PLAYER → GLOBAL  | Recharge an enchanted item.              |
+| `EnchantMachine_UpgradeItem`     | PLAYER → GLOBAL  | Upgrade an item's `enchantCapacity`.     |
+| `EnchantMachine_Result`          | GLOBAL → PLAYER  | Operation reply (`success`, `message`).  |
+| `EnchantMachine_SyncSettings`    | PLAYER → GLOBAL  | Push current settings to GLOBAL.         |
+| `EnchantMachine_SpawnBoss`       | PLAYER → GLOBAL  | Request boss spawn (fired on cell entry).|
+| `EnchantMachine_GiveRemote`      | console → GLOBAL | Debug: add a remote to the player.       |
 
 ## API Reference
-
-### Global Script Interface
 
 ```lua
 local machine = core.getGlobalScript('EnchantMachine')
@@ -201,18 +97,19 @@ local machine = core.getGlobalScript('EnchantMachine')
 machine.getSoulPower() -> number
 machine.addSoulPower(amount) -> newTotal
 machine.subtractSoulPower(amount) -> (success, remaining)
+machine.resetSoulPower() -> 0
 machine.getSoulValue(creatureId) -> number
 
 -- Item Operations
-machine.depositSoul(item, actor) -> (success, message)
-machine.rechargeItem(item, actor) -> (success, message)
+machine.depositSoul(item, actor, settings?) -> (success, message)
+machine.rechargeItem(item, actor, settings?) -> (success, message)
 machine.canBeEnchanted(item) -> (canEnchant, recordOrMessage)
 machine.getItemCapacity(item) -> number
 machine.getEffectiveEnchantCapacity(item) -> number
 
 -- Upgrade Operations
 machine.getUpgradedCapacity(itemRecordId) -> number
-machine.upgradeItemCapacity(item, capacityIncrease) -> (success, message)
+machine.upgradeItemCapacity(item, capacityIncrease, actor, settings?) -> (success, message)
 
 -- Settings
 machine.getSettings() -> {
@@ -223,307 +120,95 @@ machine.getSettings() -> {
 }
 ```
 
-### Debug Script Interface
+Settings UI is the only supported way to change settings at runtime; there is no `setSetting` API.
+
+### Debug Interface
 
 ```lua
-local debug = core.getGlobalScript('EnchantMachineDebug')
+local debug = I.EnchantMachineDebug  -- available in GLOBAL scripts
 
--- Logging
-debug.error(category, message, data)
-debug.warn(category, message, data)
-debug.info(category, message, data)
-debug.debug(category, message, data)
-debug.trace(category, message, data)
+debug.error(category, message, data?)
+debug.warn(category, message, data?)
+debug.info(category, message, data?)
+debug.debug(category, message, data?)
+debug.trace(category, message, data?)
 
--- Metrics
-debug.incrementMetric(metricName)
-debug.trackMetric(metricName, value)
+debug.incrementMetric(name)
+debug.trackMetric(name, value)
 debug.getMetrics() -> table
 
--- Performance
-debug.startTimer(timerName)
-debug.endTimer(timerName) -> elapsed
-debug.getPerformance() -> table
+debug.startTimer(name)
+debug.endTimer(name) -> elapsedSeconds
 
--- Reporting
 debug.generateReport() -> table
 debug.formatReport() -> string
 
--- Validation
-debug.validateSystemState(machineInterface) -> (isValid, message)
+debug.setLogLevel("INFO" | "WARN" | "ERROR" | "DEBUG" | "TRACE")
+debug.setDebugEnabled(bool)
 ```
 
-## Testing Guide
+## Working with Upgrades
 
-### Automated Tests
+The upgrade pipeline lives in `global.lua:upgradeItemCapacity`:
 
-```bash
-# Run all tests
-em_test
+1. Resolve the **base** record ID: check `itemBaseRecords[item.recordId]`, then fall back to pattern-matching `^(.-)_cap%d+$`, then the item's own recordId.
+2. Read the cumulative upgrade delta from `upgradedItems[baseRecordId]`.
+3. Compute `newCapacity = baseCapacity + previousUpgrade + capacityIncrease`.
+4. Create a derived record with id `<base>_cap<newCapacity>` and the new `enchantCapacity`. Store `itemBaseRecords[newId] = baseRecordId`.
+5. Instantiate the new item, copy `condition` and `enchantmentCharge` from the old instance, move into the actor, then remove the old item.
+6. Update `upgradedItems[baseRecordId]`.
 
-# View test results
-em_test_report
+`getItemCapacity` simply returns `record.enchantCapacity` — the upgrade is already baked in.
 
-# Generate XML report (CI/CD)
-em_test_xml
-```
+## Save Format
 
-### Manual Testing
-
-```bash
-# Quick setup
-em_give_gems
-em_add_souls 10000
-em_give_upgradeable
-
-# Test specific feature
-em_give_gems
-# Activate machine -> Deposit Soul Gems
-
-# Check state
-em_status
-em_debug_metrics
-
-# Monitor performance
-em_debug_perf
-```
-
-### Writing Tests
-
+`global.lua`:
 ```lua
--- In test_suite.lua
-
-local function test_my_feature()
-    local machine = getMachine()
-
-    -- Setup
-    local initial = machine.getSoulPower()
-
-    -- Execute
-    machine.addSoulPower(100)
-
-    -- Assert
-    local final = machine.getSoulPower()
-    assert_equal(final, initial + 100, "Power should increase")
-
-    -- Cleanup
-    machine.subtractSoulPower(100)
-end
-
--- Register test
-runTest("My Feature Test", test_my_feature)
+{
+    version = 2,
+    soulPower = number,
+    upgradedItems = { [baseRecordId] = totalUpgrade, ... },
+    itemBaseRecords = { [generatedRecordId] = baseRecordId, ... },
+}
 ```
 
-## Performance Best Practices
-
-### Do's:
-✅ Use performance timers for new features
-✅ Cache frequently accessed data
-✅ Batch inventory operations
-✅ Use early returns to avoid unnecessary work
-✅ Clean up UI elements when closing menus
-
-### Don'ts:
-❌ Scan entire inventory every frame
-❌ Create new objects in loops
-❌ Use expensive operations in UI rendering
-❌ Leave debug logging in production code
-❌ Store large datasets in memory
-
-### Example:
-
+`spawn_researcher.lua`:
 ```lua
--- Bad: Scans every frame
-function onUpdate()
-    local items = getAllUpgradeableItems()
-    -- ...
-end
-
--- Good: Scan only when needed
-function showUpgradeMenu()
-    local items = getAllUpgradeableItems()
-    -- ...
-end
+{ version = 1, bossSpawned = boolean }
 ```
+
+`player_full.lua`:
+```lua
+{ version = 1, bossSpawnRequested = boolean }
+```
+
+When changing the schema, bump `version` and handle migration in `onLoad`.
+
+## Adding a Feature
+
+1. Add the operation function in `global.lua`. Validate inputs and return `(success, message)`.
+2. Export it on the interface table at the bottom of `global.lua`.
+3. If the operation needs the player, define a `EnchantMachine_*` event handler in `eventHandlers` and reply via `actor:sendEvent('EnchantMachine_Result', …)`.
+4. Add a `show*Menu` function in `player_full.lua`. **Add a forward declaration at the top of the file** alongside the existing ones — Lua resolves closure upvalues at parse time, so any reference to a not-yet-declared local silently becomes a global.
+5. Wire the new menu into `createMainMenu`.
+6. Pass the current settings on the outgoing event (`settings = getSettings()`).
 
 ## Debugging Tips
 
-### 1. Enable Debug Logging
+- Set log level: `I.EnchantMachineDebug.setLogLevel("TRACE")`.
+- Generate a report: `print(I.EnchantMachineDebug.formatReport())`.
+- Reset state: `I.EnchantMachineDebug.clearLogs()`, `clearMetrics()`, `clearPerformance()`.
+- After a save/load, `I.ItemUsage` handlers do not persist — `global.lua` re-registers them in `onLoad`. If you add another handler, do the same.
 
-```lua
--- Set log level
-local debug = getDebug()
-debug.setLogLevel("DEBUG")  -- or "TRACE" for more detail
-```
+## Code Style
 
-### 2. Use Performance Timers
-
-```lua
-local debug = getDebug()
-debug.startTimer("myOperation")
--- ... operation ...
-local elapsed = debug.endTimer("myOperation")
-print("Took " .. elapsed .. "s")
-```
-
-### 3. Validate System State
-
-```lua
-local debug = getDebug()
-local machine = getMachine()
-local isValid, message = debug.validateSystemState(machine)
-if not isValid then
-    print("System issue: " .. message)
-end
-```
-
-### 4. Check Metrics
-
-```lua
-em_debug_metrics  -- Console command
-```
-
-### 5. View Logs
-
-```lua
-em_debug_logs  -- Console command
-```
-
-## Common Issues
-
-### Issue: "Global script not found"
-**Solution**: Ensure `EnchantMachine.omwscripts` is loaded
-- Check `openmw.cfg` has: `lua-scripts=EnchantMachine.omwscripts`
-- Verify file path is correct
-
-### Issue: Scripts not reloading
-**Solution**: Use `reloadlua` command
-- Only works for unarchived files
-- Restart OpenMW if using BSA
-
-### Issue: UI doesn't appear
-**Solution**: Check for errors
-- Press F10 to view console log
-- Look for Lua errors
-- Verify script is attached to activator
-
-### Issue: Settings not saving
-**Solution**: Check storage permissions
-- Ensure OpenMW has write access to config directory
-- Use `permanentStorage = false` in settings
-
-## Extending the Mod
-
-### Adding Custom Items
-
-```lua
--- Create custom soul gems
-local customGem = world.createObject("misc_soulgem_common", 1)
-local gemData = types.Miscellaneous.itemData(customGem)
-gemData.soul = "dremora"
-customGem:moveInto(playerInventory)
-```
-
-### Integrating with Quests
-
-See `quest_example.lua` for complete example:
-
-```lua
--- Listen for soul deposits
-eventHandlers = {
-    SoulDeposited = function(data)
-        -- Your quest logic
-    end,
-}
-```
-
-### Custom Machine Placements
-
-See `placement_helper.lua` for utilities:
-
-```bash
-em_place_help       # Show placement guide
-em_place_locations  # List predefined locations
-```
-
-## CI/CD Integration
-
-### Automated Testing
-
-```bash
-#!/bin/bash
-# test.sh
-
-# Start OpenMW headless (if available)
-openmw --skip-menu --script-console
-
-# Run tests via console
-echo "em_test" | openmw-console
-
-# Check exit code
-if [ $? -eq 0 ]; then
-    echo "Tests passed"
-else
-    echo "Tests failed"
-    exit 1
-fi
-```
-
-### Version Management
-
-```lua
--- In global.lua onSave/onLoad
-return {
-    version = 2,  -- Increment when making breaking changes
-}
-
--- Handle migrations
-if data.version == 1 then
-    -- Migrate from v1 to v2
-    migrateData(data)
-end
-```
-
-## Contributing
-
-### Pull Request Checklist
-
-- [ ] Code follows existing style
-- [ ] Added debug logging for new features
-- [ ] Added tests for new functionality
-- [ ] Updated documentation
-- [ ] Tested with `em_test`
-- [ ] No performance regressions (`em_debug_perf`)
-- [ ] Added localization strings
-- [ ] Updated CHANGELOG
-
-### Code Style
-
-- Use 4 spaces for indentation
-- Functions are `camelCase`
-- Constants are `UPPER_SNAKE_CASE`
-- Local variables are `lowerCase`
-- Add comments for complex logic
-- Use descriptive variable names
+- 4-space indentation.
+- Functions: `camelCase`. Constants: `UPPER_SNAKE_CASE`. Locals: `lowerCase`.
+- Prefer the `local function` form. For mutually-recursive locals (e.g., menu functions), declare them all up front and assign with `name = function(...)`.
+- Wrap engine calls that may fail in `pcall` (`world.createRecord`, `world.createObject`, `creature:teleport`).
+- Comment only the non-obvious: workarounds, invariants, lifecycle constraints.
 
 ## Resources
 
 - **OpenMW Lua Docs**: https://openmw.readthedocs.io/en/stable/reference/lua-scripting/
 - **OpenMW Forums**: https://forum.openmw.org/
-- **GitLab**: https://gitlab.com/OpenMW/openmw
-- **Discord**: https://discord.gg/openmw
-
-## Support
-
-For bugs or feature requests:
-1. Check existing issues
-2. Provide OpenMW version
-3. Include reproduction steps
-4. Attach debug logs (`em_debug_logs`)
-5. Share system validation (`em_status`)
-
----
-
-**Last Updated:** 2025-01-08
-**Mod Version:** 0.3.0-beta
-**OpenMW Version:** 0.49+

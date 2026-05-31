@@ -150,7 +150,7 @@ Complete a small quest to earn the remote.
 3. Bring them to a specific location
 4. Receive the remote as a reward
 
-See `quest_example.lua` for implementation template.
+A reward-on-quest-completion flow is not implemented yet — the boss-loot path in `spawn_researcher.lua` is the only built-in option. Future work could wire this up by listening for a quest-state change and firing `EnchantMachine_GiveRemote`.
 
 ---
 

@@ -7,22 +7,19 @@ local core = require('openmw.core')
 local types = require('openmw.types')
 local util = require('openmw.util')
 local async = require('openmw.async')
-local input = require('openmw.input')
 local storage = require('openmw.storage')
 local I = require('openmw.interfaces')
 
 print("[EnchantMachine] Player script loading...")
 
--- Register settings page
+-- ---------- Settings registration ----------
+
 I.Settings.registerPage({
     key = 'EnchantMachine',
     l10n = 'EnchantMachine',
     name = 'Dwemer Enchanting Machine',
     description = 'Configure the enchanting machine settings and view soul power',
 })
-
--- Shared storage to read soul power (written by GLOBAL script, display cache only)
-local sharedData = storage.globalSection('EnchantMachine_SharedData')
 
 I.Settings.registerGroup({
     key = 'SettingsEnchantMachineStatus',
@@ -37,14 +34,11 @@ I.Settings.registerGroup({
             name = 'Soul Power',
             description = 'Current soul power in the bank (read-only display)',
             default = '0',
-            argument = {
-                disabled = true,
-            },
+            argument = { disabled = true },
         },
     },
 })
 
--- Register settings
 I.Settings.registerGroup({
     key = 'SettingsEnchantMachineConfig',
     page = 'EnchantMachine',
@@ -65,11 +59,7 @@ I.Settings.registerGroup({
             name = 'Enchant Multiplier',
             description = 'Multiplier for enchantment capacity (default: 10x)',
             default = 10,
-            argument = {
-                integer = true,
-                min = 1,
-                max = 100,
-            },
+            argument = { integer = true, min = 1, max = 100 },
         },
         {
             key = 'upgradeRatio',
@@ -77,11 +67,7 @@ I.Settings.registerGroup({
             name = 'Upgrade Ratio',
             description = 'Soul power cost per capacity point (default: 100:1)',
             default = 100,
-            argument = {
-                integer = true,
-                min = 1,
-                max = 1000,
-            },
+            argument = { integer = true, min = 1, max = 1000 },
         },
         {
             key = 'enableUpgradeFeature',
@@ -94,38 +80,54 @@ I.Settings.registerGroup({
             key = 'howToAccess',
             renderer = 'textLine',
             name = 'How to Access Machine',
-            description = 'Activate a machine object with script attached, OR use lua player console to send event',
+            description = 'Use the Dwemer Enchanting Machine Remote from your inventory',
             default = 'See description',
-            argument = {
-                disabled = true,
-            },
+            argument = { disabled = true },
         },
     },
 })
 
-print("[EnchantMachine] Player script registered settings pages")
+-- ---------- State ----------
 
--- State
-local currentMenu = nil
-local menuMode = false
+local sharedData = storage.globalSection('EnchantMachine_SharedData')
 local statusSettings = storage.playerSection('SettingsEnchantMachineStatus')
 local configSettings = storage.playerSection('SettingsEnchantMachineConfig')
+
+local currentMenu = nil
 local updateTimer = 0
-local updateInterval = 1.0
+local UPDATE_INTERVAL = 1.0
 
--- Helper: Set pause/menu mode
-local function setMenuMode(enabled)
-    menuMode = enabled
-    if core.API_REVISION > 30 then
-        if enabled then
-            I.UI.setMode('Interface', { windows = {} })
-        else
-            I.UI.setMode()
-        end
-    end
-end
+-- Boss-cell detection (persisted across save/load via onSave/onLoad below)
+local lastCellName = nil
+local bossSpawnRequested = false
+local BOSS_CELL_NAME = "Arkngthand, Deep Ore Passage"
 
--- Helper: Get current settings
+-- Dwemer-scroll quest trigger (EM_DwemerDiscovery). Looting from a corpse is an
+-- inventory transfer, not a world activation, and OpenMW has no inventory-add
+-- engine handler — so we detect the scroll by a throttled inventory poll rather
+-- than onActivated. No persistence needed: the journal stage itself is the state.
+-- NOTE: content-file string ids are lower-cased by the engine, so the quest key
+-- is lowercase even though OpenMW-CS shows "EM_DwemerDiscovery".
+local SCROLL_QUEST_ID = "em_dwemerdiscovery"
+local SCROLL_LOOTED_STAGE = 10
+local SCROLL_ITEM_ENCODED = "em_dwemer_scroll_encoded"
+local SCROLL_ITEM_DECODED = "em_dwemer_scroll_decoded"
+local scrollJournalDone = false
+
+-- ---------- Forward declarations ----------
+-- All menu functions reference each other (Back buttons, retry-after-result, etc.),
+-- so we declare every binding up front. Lua resolves closure upvalues at parse time;
+-- forgetting any of these would silently turn a call into a nil global lookup.
+
+local createMenu
+local createMainMenu
+local showDepositMenu
+local showRechargeMenu
+local showUpgradeMenu
+local showUpgradeAmountMenu
+
+-- ---------- Settings sync (PLAYER -> GLOBAL) ----------
+
 local function getSettings()
     return {
         enableMachine = configSettings:get('enableMachine'),
@@ -135,12 +137,30 @@ local function getSettings()
     }
 end
 
--- Helper: Get soul power (read from shared storage)
+-- Push current settings to GLOBAL so machine.getSettings() (the public API)
+-- returns user-configured values, not the GLOBAL defaults.
+local function syncSettingsToGlobal()
+    core.sendGlobalEvent('EnchantMachine_SyncSettings', getSettings())
+end
+
+-- Fire whenever any setting in our group changes. The callback signature is
+-- (sectionName, key) — key is nil when the whole section was reset.
+configSettings:subscribe(async:callback(function() syncSettingsToGlobal() end))
+
+-- ---------- Helpers ----------
+
+local function setMenuMode(enabled)
+    if enabled then
+        I.UI.setMode('Interface', { windows = {} })
+    else
+        I.UI.setMode()
+    end
+end
+
 local function getSoulPower()
     return sharedData:get('soulPower') or 0
 end
 
--- Helper: Close current menu
 local function closeMenu()
     if currentMenu then
         pcall(function() currentMenu:destroy() end)
@@ -149,110 +169,12 @@ local function closeMenu()
     setMenuMode(false)
 end
 
--- Helper: Get filled soul gems
-local function getFilledSoulGems()
-    local inventory = types.Actor.inventory(self)
-    local soulGems = {}
-
-    for _, item in ipairs(inventory:getAll()) do
-        if types.Miscellaneous.objectIsInstance(item) then
-            local itemData = types.Miscellaneous.itemData(item)
-            if itemData and itemData.soul then
-                local record = types.Miscellaneous.record(item)
-
-                -- PLAYER scripts can't access creature records, so show gem capacity
-                -- The actual soul value will be calculated by GLOBAL script during deposit
-                local gemCapacity = 0
-                if record then
-                    local id = record.id:lower()
-                    if id:find("grand") or id:find("azura") then
-                        gemCapacity = 600
-                    elseif id:find("greater") then
-                        gemCapacity = 300
-                    elseif id:find("common") then
-                        gemCapacity = 150
-                    elseif id:find("lesser") then
-                        gemCapacity = 100
-                    elseif id:find("petty") then
-                        gemCapacity = 50
-                    else
-                        gemCapacity = 100 -- default fallback
-                    end
-                end
-
-                table.insert(soulGems, {
-                    item = item,
-                    record = record,
-                    soul = itemData.soul,
-                    soulValue = gemCapacity,  -- Display gem capacity (not actual soul value)
-                })
-            end
-        end
-    end
-
-    return soulGems
-end
-
--- Helper: Get rechargeable items
-local function getRechargeableItems()
-    local inventory = types.Actor.inventory(self)
-    local items = {}
-
-    for _, item in ipairs(inventory:getAll()) do
-        local isWeapon = types.Weapon.objectIsInstance(item)
-        local isArmor = types.Armor.objectIsInstance(item)
-        local isClothing = types.Clothing.objectIsInstance(item)
-
-        if isWeapon or isArmor or isClothing then
-            local record
-            if isWeapon then
-                record = types.Weapon.record(item)
-            elseif isArmor then
-                record = types.Armor.record(item)
-            else
-                record = types.Clothing.record(item)
-            end
-
-            if record and record.enchant and record.enchant ~= "" then
-                local itemData
-                if isWeapon then
-                    itemData = types.Weapon.itemData(item)
-                elseif isArmor then
-                    itemData = types.Armor.itemData(item)
-                else
-                    itemData = types.Clothing.itemData(item)
-                end
-
-                local enchantment = core.magic.enchantments.records[record.enchant]
-                if enchantment then
-                    local maxCharge = enchantment.charge or 0
-                    local currentCharge = (itemData and itemData.enchantmentCharge) or maxCharge
-
-                    if currentCharge < maxCharge then
-                        table.insert(items, {
-                            item = item,
-                            record = record,
-                            currentCharge = currentCharge,
-                            maxCharge = maxCharge,
-                        })
-                    end
-                end
-            end
-        end
-    end
-
-    return items
-end
-
--- Helper: Create button
 local function createButton(text, onClick, enabled)
-    enabled = enabled == nil and true or enabled
+    if enabled == nil then enabled = true end
 
     return {
         template = I.MWUI.templates.box,
-        props = {
-            alpha = enabled and 1.0 or 0.5,
-        },
+        props = { alpha = enabled and 1.0 or 0.5 },
         content = ui.content{
             {
                 type = ui.TYPE.Text,
@@ -264,102 +186,110 @@ local function createButton(text, onClick, enabled)
                 },
             },
         },
-        events = enabled and {
-            mouseClick = async:callback(onClick),
-        } or {},
+        events = enabled and { mouseClick = async:callback(onClick) } or {},
     }
 end
 
--- Show deposit menu
-local function showDepositMenu()
-    closeMenu()
+local function spacer(height)
+    return {
+        type = ui.TYPE.Flex,
+        props = { size = util.vector2(0, height) },
+    }
+end
 
-    print("[EnchantMachine] showDepositMenu called")
-    local soulGems = getFilledSoulGems()
-    print("[EnchantMachine] Found " .. #soulGems .. " soul gems")
-
-    if #soulGems == 0 then
-        ui.showMessage("You have no filled soul gems to deposit.")
-        async:newUnsavableSimulationTimer(1.5, function()
-            createMainMenu()
-        end)
-        return
-    end
-
-    setMenuMode(true)
-
-    local menuContent = {
-        -- Title
-        {
-            template = I.MWUI.templates.boxSolid,
-            content = ui.content{
-                {
-                    type = ui.TYPE.Text,
-                    template = I.MWUI.templates.textHeader,
-                    props = {
-                        text = "Deposit Soul Gems",
-                        textSize = 20,
-                    },
-                },
-            },
+local function textLine(text, opts)
+    opts = opts or {}
+    return {
+        type = ui.TYPE.Text,
+        template = I.MWUI.templates.textNormal,
+        props = {
+            text = text,
+            textSize = opts.size or 14,
+            textColor = opts.color,
         },
-        -- Info
-        {
-            type = ui.TYPE.Text,
-            template = I.MWUI.templates.textNormal,
-            props = {
-                text = "Select a soul gem to deposit. Gems are consumed permanently.",
-                textSize = 14,
-            },
-        },
-        -- Spacing
-        {
-            type = ui.TYPE.Flex,
-            props = {
-                size = util.vector2(0, 10),
+    }
+end
+
+local function boxedTitle(text, size)
+    return {
+        template = I.MWUI.templates.boxSolid,
+        content = ui.content{
+            {
+                type = ui.TYPE.Text,
+                template = I.MWUI.templates.textHeader,
+                props = { text = text, textSize = size or 20 },
             },
         },
     }
+end
 
-    -- Add gem buttons
-    for _, gemData in ipairs(soulGems) do
-        local gemName = gemData.record.name or "Soul Gem"
-        local soulName = gemData.soul or "Unknown"
+local function bareHeader(text, size)
+    return {
+        type = ui.TYPE.Text,
+        template = I.MWUI.templates.textHeader,
+        props = { text = text, textSize = size or 30 },
+    }
+end
 
-        table.insert(menuContent, createButton(
-            gemName .. " (" .. soulName .. ")",
-            function()
-                -- Send event to global script to deposit
-                core.sendGlobalEvent('EnchantMachine_DepositGem', {
-                    actor = self.object,
-                    item = gemData.item,
-                    settings = getSettings(),
-                })
-                ui.showMessage("Depositing soul gem...")
-                closeMenu()
-            end
-        ))
+-- Build and display a vertical, centered menu.
+-- opts = {
+--   header    = { type = 'boxed'|'bare', text = string, size = number? }  -- optional
+--   info      = string?                  -- normal text under the header
+--   warning   = string?                  -- yellow callout text
+--   items     = table                    -- pre-built UI nodes (buttons, spacers, etc.)
+--   onBack    = function?                -- if set, appends a Back button
+--   backLabel = string?                  -- defaults to "Back"
+-- }
+createMenu = function(opts)
+    setMenuMode(true)
+
+    local content = {}
+
+    if opts.header then
+        if opts.header.type == 'bare' then
+            table.insert(content, bareHeader(opts.header.text, opts.header.size))
+        else
+            table.insert(content, boxedTitle(opts.header.text, opts.header.size))
+        end
     end
 
-    -- Spacing
-    table.insert(menuContent, {
-        type = ui.TYPE.Flex,
-        props = {
-            size = util.vector2(0, 10),
-        },
-    })
+    if opts.info then
+        table.insert(content, textLine(opts.info))
+    end
 
-    -- Back button
-    table.insert(menuContent, createButton("Back", function()
-        createMainMenu()
-    end))
+    if opts.warning then
+        table.insert(content, textLine(opts.warning, { size = 12, color = util.color.rgb(1, 1, 0) }))
+    end
+
+    -- MWUI has no scroll container, so a long centered list can push the Back
+    -- button off the bottom of the screen (the "can't back out" bug). For long
+    -- lists we render Back at the TOP and top-anchor the window (below) so the
+    -- header and Back stay on-screen; short menus stay centered with Back at the
+    -- bottom as before.
+    local menuItems = opts.items or {}
+    local longList = #menuItems > 8
+
+    if opts.onBack and longList then
+        table.insert(content, createButton(opts.backLabel or "Back", opts.onBack))
+    end
+
+    table.insert(content, spacer(10))
+
+    for _, item in ipairs(menuItems) do
+        table.insert(content, item)
+    end
+
+    if opts.onBack and not longList then
+        table.insert(content, spacer(10))
+        table.insert(content, createButton(opts.backLabel or "Back", opts.onBack))
+    end
 
     local menu = ui.create{
         layer = 'Windows',
         template = I.MWUI.templates.boxTransparent,
         props = {
-            relativePosition = util.vector2(0.5, 0.5),
-            anchor = util.vector2(0.5, 0.5),
+            relativePosition = longList and util.vector2(0.5, 0.04) or util.vector2(0.5, 0.5),
+            anchor = longList and util.vector2(0.5, 0.0) or util.vector2(0.5, 0.5),
         },
         content = ui.content{
             {
@@ -369,81 +299,161 @@ local function showDepositMenu()
                     arrange = ui.ALIGNMENT.Center,
                     align = ui.ALIGNMENT.Center,
                 },
-                content = ui.content(menuContent),
+                content = ui.content(content),
             },
         },
     }
 
-    print("[EnchantMachine] Created deposit menu")
     currentMenu = menu
+    return menu
 end
 
--- Show recharge menu
-local function showRechargeMenu()
+-- ---------- Inventory scans ----------
+
+local function getFilledSoulGems()
+    local gems = {}
+    for _, item in ipairs(types.Actor.inventory(self):getAll()) do
+        if types.Miscellaneous.objectIsInstance(item) then
+            local itemData = types.Miscellaneous.itemData(item)
+            if itemData and itemData.soul then
+                -- Resolve the trapped soul's creature record for its display name
+                -- and soul value. Records are static game data and readable from
+                -- the player context (the value is not a property of a nearby
+                -- instance). Guarded so an odd/missing soul id can't break the menu.
+                local soulName, soulValue = itemData.soul, 0
+                local ok, creature = pcall(function() return types.Creature.records[itemData.soul] end)
+                if ok and creature then
+                    soulName = creature.name or itemData.soul
+                    soulValue = creature.soulValue or 0
+                end
+                table.insert(gems, {
+                    item = item,
+                    record = types.Miscellaneous.record(item),
+                    soul = itemData.soul,
+                    soulName = soulName,
+                    soulValue = soulValue,
+                })
+            end
+        end
+    end
+    return gems
+end
+
+local function getEnchantableRecord(item)
+    if types.Weapon.objectIsInstance(item) then
+        return types.Weapon.record(item), types.Weapon.itemData(item)
+    elseif types.Armor.objectIsInstance(item) then
+        return types.Armor.record(item), types.Armor.itemData(item)
+    elseif types.Clothing.objectIsInstance(item) then
+        return types.Clothing.record(item), types.Clothing.itemData(item)
+    end
+end
+
+local function getRechargeableItems()
+    local items = {}
+    for _, item in ipairs(types.Actor.inventory(self):getAll()) do
+        local record, itemData = getEnchantableRecord(item)
+        if record and record.enchant and record.enchant ~= "" then
+            local enchantment = core.magic.enchantments.records[record.enchant]
+            if enchantment then
+                local maxCharge = enchantment.charge or 0
+                local currentCharge = (itemData and itemData.enchantmentCharge) or maxCharge
+                if currentCharge < maxCharge then
+                    table.insert(items, {
+                        item = item,
+                        record = record,
+                        currentCharge = currentCharge,
+                        maxCharge = maxCharge,
+                    })
+                end
+            end
+        end
+    end
+    return items
+end
+
+local function getUpgradeableItems()
+    local items = {}
+    for _, item in ipairs(types.Actor.inventory(self):getAll()) do
+        local record = getEnchantableRecord(item)
+        if record
+            and record.enchantCapacity and record.enchantCapacity > 0
+            and (not record.enchant or record.enchant == "")
+        then
+            table.insert(items, { item = item, record = record })
+        end
+    end
+    return items
+end
+
+-- ---------- Menu definitions ----------
+
+showDepositMenu = function()
     closeMenu()
 
-    local items = getRechargeableItems()
-
-    if #items == 0 then
-        ui.showMessage("You have no enchanted items that need recharging.")
-        async:newUnsavableSimulationTimer(1.5, function()
-            createMainMenu()
-        end)
+    local gems = getFilledSoulGems()
+    if #gems == 0 then
+        ui.showMessage("You have no filled soul gems to deposit.")
+        async:newUnsavableSimulationTimer(1.5, function() createMainMenu() end)
         return
     end
 
-    setMenuMode(true)
-    local soulPower = getSoulPower()
-    local menuContent = {
-        -- Title
-        {
-            template = I.MWUI.templates.boxSolid,
-            content = ui.content{
-                {
-                    type = ui.TYPE.Text,
-                    template = I.MWUI.templates.textHeader,
-                    props = {
-                        text = "Recharge Enchanted Items",
-                        textSize = 20,
-                    },
-                },
-            },
-        },
-        -- Info
-        {
-            type = ui.TYPE.Text,
-            template = I.MWUI.templates.textNormal,
-            props = {
-                text = "Soul Power: " .. math.floor(soulPower) .. " | Cost: 1 power per charge point",
-                textSize = 14,
-            },
-        },
-        -- Spacing
-        {
-            type = ui.TYPE.Flex,
-            props = {
-                size = util.vector2(0, 10),
-            },
-        },
-    }
+    local items = {}
+    for _, gem in ipairs(gems) do
+        local gemName = (gem.record and gem.record.name) or "Soul Gem"
+        local soulName = gem.soulName or gem.soul or "Unknown"
+        local label = gemName .. " (" .. soulName
+        if (gem.soulValue or 0) > 0 then
+            label = label .. " - " .. gem.soulValue .. " power"
+        end
+        label = label .. ")"
+        table.insert(items, createButton(
+            label,
+            function()
+                core.sendGlobalEvent('EnchantMachine_DepositGem', {
+                    actor = self.object,
+                    item = gem.item,
+                    settings = getSettings(),
+                })
+                ui.showMessage("Depositing soul gem...")
+                closeMenu()
+            end
+        ))
+    end
 
-    -- Add item buttons
-    for _, itemData in ipairs(items) do
-        local itemName = itemData.record.name or "Item"
-        local current = math.floor(itemData.currentCharge)
-        local max = math.floor(itemData.maxCharge)
-        local needed = math.ceil(itemData.maxCharge - itemData.currentCharge)
+    createMenu{
+        header = { type = 'boxed', text = "Deposit Soul Gems" },
+        info = "Select a soul gem to deposit. Gems are consumed permanently.",
+        items = items,
+        onBack = function() createMainMenu() end,
+    }
+end
+
+showRechargeMenu = function()
+    closeMenu()
+
+    local rechargeable = getRechargeableItems()
+    if #rechargeable == 0 then
+        ui.showMessage("You have no enchanted items that need recharging.")
+        async:newUnsavableSimulationTimer(1.5, function() createMainMenu() end)
+        return
+    end
+
+    local soulPower = getSoulPower()
+    local items = {}
+    for _, entry in ipairs(rechargeable) do
+        local itemName = entry.record.name or "Item"
+        local current = math.floor(entry.currentCharge)
+        local max = math.floor(entry.maxCharge)
+        local needed = math.ceil(entry.maxCharge - entry.currentCharge)
         local canAfford = soulPower >= needed
 
-        local buttonText = string.format("%s (%d/%d) - %d power needed",
-            itemName, current, max, needed)
-
-        table.insert(menuContent, createButton(
-            buttonText,
+        table.insert(items, createButton(
+            string.format("%s (%d/%d) - %d power needed", itemName, current, max, needed),
             function()
                 core.sendGlobalEvent('EnchantMachine_RechargeItem', {
                     actor = self.object,
-                    item = itemData.item,
+                    item = entry.item,
                     settings = getSettings(),
                 })
                 ui.showMessage("Recharging item...")
@@ -453,252 +463,71 @@ local function showRechargeMenu()
         ))
     end
 
-    -- Spacing
-    table.insert(menuContent, {
-        type = ui.TYPE.Flex,
-        props = {
-            size = util.vector2(0, 10),
-        },
-    })
-
-    -- Back button
-    table.insert(menuContent, createButton("Back", function()
-        createMainMenu()
-    end))
-
-    local menu = ui.create{
-        layer = 'Windows',
-        template = I.MWUI.templates.boxTransparent,
-        props = {
-            relativePosition = util.vector2(0.5, 0.5),
-            anchor = util.vector2(0.5, 0.5),
-        },
-        content = ui.content{
-            {
-                type = ui.TYPE.Flex,
-                props = {
-                    vertical = true,
-                    arrange = ui.ALIGNMENT.Center,
-                    align = ui.ALIGNMENT.Center,
-                },
-                content = ui.content(menuContent),
-            },
-        },
+    createMenu{
+        header = { type = 'boxed', text = "Recharge Enchanted Items" },
+        info = "Soul Power: " .. math.floor(soulPower) .. " | Cost: 1 power per charge point",
+        items = items,
+        onBack = function() createMainMenu() end,
     }
-
-    currentMenu = menu
 end
 
--- Forward declarations for functions defined later
-local showUpgradeAmountMenu
-local createMainMenu
-
--- Show upgrade menu (item selection)
-local function showUpgradeMenu()
+showUpgradeMenu = function()
     closeMenu()
-    setMenuMode(true)
 
     local settings = getSettings()
     if not settings.enableUpgradeFeature then
         ui.showMessage("Upgrade feature is locked. Enable it in settings!")
-        async:newUnsavableSimulationTimer(1.5, function()
-            createMainMenu()
-        end)
+        async:newUnsavableSimulationTimer(1.5, function() createMainMenu() end)
         return
     end
 
-    -- Get upgradeable items (weapons, armor, clothing with enchant capacity)
-    local inventory = types.Actor.inventory(self)
-    local items = {}
-
-    for _, item in ipairs(inventory:getAll()) do
-        local isWeapon = types.Weapon.objectIsInstance(item)
-        local isArmor = types.Armor.objectIsInstance(item)
-        local isClothing = types.Clothing.objectIsInstance(item)
-
-        if isWeapon or isArmor or isClothing then
-            local record
-            if isWeapon then
-                record = types.Weapon.record(item)
-            elseif isArmor then
-                record = types.Armor.record(item)
-            else
-                record = types.Clothing.record(item)
-            end
-
-            -- Only include unenchanted items (can't upgrade enchanted items)
-            if record and record.enchantCapacity and record.enchantCapacity > 0 then
-                if not record.enchant or record.enchant == "" then
-                    table.insert(items, {
-                        item = item,
-                        record = record,
-                    })
-                end
-            end
-        end
-    end
-
-    if #items == 0 then
+    local upgradeable = getUpgradeableItems()
+    if #upgradeable == 0 then
         ui.showMessage("You have no items that can be upgraded.")
-        async:newUnsavableSimulationTimer(1.5, function()
-            createMainMenu()
-        end)
+        async:newUnsavableSimulationTimer(1.5, function() createMainMenu() end)
         return
     end
 
     local soulPower = getSoulPower()
     local ratio = settings.upgradeRatio or 100
 
-    local menuContent = {
-        -- Title
-        {
-            template = I.MWUI.templates.boxSolid,
-            content = ui.content{
-                {
-                    type = ui.TYPE.Text,
-                    template = I.MWUI.templates.textHeader,
-                    props = {
-                        text = "Upgrade Item Capacity",
-                        textSize = 20,
-                    },
-                },
-            },
-        },
-        -- Info
-        {
-            type = ui.TYPE.Text,
-            template = I.MWUI.templates.textNormal,
-            props = {
-                text = string.format("Soul Power: %d | Cost: %d power per capacity point",
-                    math.floor(soulPower), ratio),
-                textSize = 14,
-            },
-        },
-        -- Warning about unenchanted items only
-        {
-            type = ui.TYPE.Text,
-            template = I.MWUI.templates.textNormal,
-            props = {
-                text = "Note: Only unenchanted items can be upgraded. Upgrade before enchanting!",
-                textSize = 12,
-                textColor = util.color.rgb(1, 1, 0),
-            },
-        },
-        -- Spacing
-        {
-            type = ui.TYPE.Flex,
-            props = {
-                size = util.vector2(0, 10),
-            },
-        },
-    }
-
-    -- Add item buttons
-    for _, itemData in ipairs(items) do
-        local itemName = itemData.record.name or "Item"
-        local capacity = math.floor(itemData.record.enchantCapacity or 0)
-
-        table.insert(menuContent, createButton(
+    local items = {}
+    for _, entry in ipairs(upgradeable) do
+        local itemName = entry.record.name or "Item"
+        local capacity = math.floor(entry.record.enchantCapacity or 0)
+        table.insert(items, createButton(
             string.format("%s (Capacity: %d)", itemName, capacity),
-            function()
-                showUpgradeAmountMenu(itemData, ratio, soulPower)
-            end
+            function() showUpgradeAmountMenu(entry, ratio, soulPower) end
         ))
     end
 
-    -- Spacing
-    table.insert(menuContent, {
-        type = ui.TYPE.Flex,
-        props = {
-            size = util.vector2(0, 10),
-        },
-    })
-
-    -- Back button
-    table.insert(menuContent, createButton("Back", function()
-        createMainMenu()
-    end))
-
-    local menu = ui.create{
-        layer = 'Windows',
-        template = I.MWUI.templates.boxTransparent,
-        props = {
-            relativePosition = util.vector2(0.5, 0.5),
-            anchor = util.vector2(0.5, 0.5),
-        },
-        content = ui.content{
-            {
-                type = ui.TYPE.Flex,
-                props = {
-                    vertical = true,
-                    arrange = ui.ALIGNMENT.Center,
-                    align = ui.ALIGNMENT.Center,
-                },
-                content = ui.content(menuContent),
-            },
-        },
+    createMenu{
+        header = { type = 'boxed', text = "Upgrade Item Capacity" },
+        info = string.format("Soul Power: %d | Cost: %d power per capacity point",
+            math.floor(soulPower), ratio),
+        warning = "Note: Only unenchanted items can be upgraded. Upgrade before enchanting!",
+        items = items,
+        onBack = function() createMainMenu() end,
     }
-
-    currentMenu = menu
 end
 
--- Show upgrade amount selection menu
-showUpgradeAmountMenu = function(itemData, ratio, soulPower)
+showUpgradeAmountMenu = function(entry, ratio, soulPower)
     closeMenu()
-    setMenuMode(true)
 
-    local itemName = itemData.record.name or "Item"
-    local currentCapacity = math.floor(itemData.record.enchantCapacity or 0)
+    local itemName = entry.record.name or "Item"
+    local currentCapacity = math.floor(entry.record.enchantCapacity or 0)
 
-    local menuContent = {
-        -- Title
-        {
-            template = I.MWUI.templates.boxSolid,
-            content = ui.content{
-                {
-                    type = ui.TYPE.Text,
-                    template = I.MWUI.templates.textHeader,
-                    props = {
-                        text = "Upgrade: " .. itemName,
-                        textSize = 20,
-                    },
-                },
-            },
-        },
-        -- Info
-        {
-            type = ui.TYPE.Text,
-            template = I.MWUI.templates.textNormal,
-            props = {
-                text = string.format("Current Capacity: %d | Soul Power: %d",
-                    currentCapacity, math.floor(soulPower)),
-                textSize = 14,
-            },
-        },
-        -- Spacing
-        {
-            type = ui.TYPE.Flex,
-            props = {
-                size = util.vector2(0, 10),
-            },
-        },
-    }
-
-    -- Upgrade options
-    local upgradeOptions = {1, 5, 10, 25, 50, 100}
-
-    for _, amount in ipairs(upgradeOptions) do
+    local items = {}
+    for _, amount in ipairs({1, 5, 10, 25, 50, 100}) do
         local cost = amount * ratio
         local canAfford = soulPower >= cost
         local newCapacity = currentCapacity + amount
-
-        table.insert(menuContent, createButton(
-            string.format("+%d capacity (%d power) → %d total",
-                amount, cost, newCapacity),
+        table.insert(items, createButton(
+            string.format("+%d capacity (%d power) → %d total", amount, cost, newCapacity),
             function()
                 core.sendGlobalEvent('EnchantMachine_UpgradeItem', {
                     actor = self.object,
-                    item = itemData.item,
+                    item = entry.item,
                     amount = amount,
                     settings = getSettings(),
                 })
@@ -709,244 +538,156 @@ showUpgradeAmountMenu = function(itemData, ratio, soulPower)
         ))
     end
 
-    -- Spacing
-    table.insert(menuContent, {
-        type = ui.TYPE.Flex,
-        props = {
-            size = util.vector2(0, 10),
-        },
-    })
-
-    -- Back button
-    table.insert(menuContent, createButton("Back", function()
-        showUpgradeMenu()
-    end))
-
-    local menu = ui.create{
-        layer = 'Windows',
-        template = I.MWUI.templates.boxTransparent,
-        props = {
-            relativePosition = util.vector2(0.5, 0.5),
-            anchor = util.vector2(0.5, 0.5),
-        },
-        content = ui.content{
-            {
-                type = ui.TYPE.Flex,
-                props = {
-                    vertical = true,
-                    arrange = ui.ALIGNMENT.Center,
-                    align = ui.ALIGNMENT.Center,
-                },
-                content = ui.content(menuContent),
-            },
-        },
+    createMenu{
+        header = { type = 'boxed', text = "Upgrade: " .. itemName },
+        info = string.format("Current Capacity: %d | Soul Power: %d",
+            currentCapacity, math.floor(soulPower)),
+        items = items,
+        onBack = showUpgradeMenu,
     }
-
-    currentMenu = menu
 end
 
--- Create main menu
 createMainMenu = function()
     closeMenu()
 
     local soulPower = getSoulPower()
     local settings = getSettings()
 
-    setMenuMode(true)
-
-    -- Build menu content
-    local menuContent = {}
-
-    -- Title
-    table.insert(menuContent, {
-        type = ui.TYPE.Text,
-        template = I.MWUI.templates.textHeader,
-        props = {
-            text = "Dwemer Enchanting Machine",
-            textSize = 30,
-        },
-    })
-
-    -- Soul power display
-    table.insert(menuContent, {
-        type = ui.TYPE.Text,
-        template = I.MWUI.templates.textNormal,
-        props = {
-            text = "Soul Power: " .. math.floor(soulPower),
-            textSize = 20,
-        },
-    })
-
-    -- Spacing
-    table.insert(menuContent, {
-        type = ui.TYPE.Flex,
-        props = {
-            size = util.vector2(0, 20),
-        },
-    })
-
-    -- Deposit button
-    table.insert(menuContent, createButton("Deposit Soul Gems", function()
-        showDepositMenu()
-    end))
-
-    -- Recharge button
-    table.insert(menuContent, createButton("Recharge Enchanted Items", function()
-        showRechargeMenu()
-    end))
-
-    -- Upgrade button (or locked message)
+    local items = {}
+    table.insert(items, createButton("Deposit Soul Gems", showDepositMenu))
+    table.insert(items, createButton("Recharge Enchanted Items", showRechargeMenu))
     if settings.enableUpgradeFeature then
-        table.insert(menuContent, createButton("Upgrade Item Capacity", function()
-            showUpgradeMenu()
-        end))
+        table.insert(items, createButton("Upgrade Item Capacity", showUpgradeMenu))
     else
-        table.insert(menuContent, {
-            type = ui.TYPE.Text,
-            template = I.MWUI.templates.textNormal,
-            props = {
-                text = "[Upgrade Capacity - Locked]",
-                textSize = 18,
-                textColor = util.color.rgb(0.5, 0.5, 0.5),
-            },
-        })
+        table.insert(items, textLine("[Upgrade Capacity - Locked]",
+            { size = 18, color = util.color.rgb(0.5, 0.5, 0.5) }))
     end
+    table.insert(items, spacer(20))
+    table.insert(items, createButton("Exit", closeMenu))
 
-    -- Spacing
-    table.insert(menuContent, {
-        type = ui.TYPE.Flex,
-        props = {
-            size = util.vector2(0, 20),
-        },
-    })
-
-    -- Exit button
-    table.insert(menuContent, createButton("Exit", function()
-        closeMenu()
-    end))
-
-    -- Create the menu
-    local menu = ui.create{
-        layer = 'Windows',
-        template = I.MWUI.templates.boxTransparent,
-        props = {
-            relativePosition = util.vector2(0.5, 0.5),
-            anchor = util.vector2(0.5, 0.5),
-        },
-        content = ui.content{
-            {
-                type = ui.TYPE.Flex,
-                props = {
-                    vertical = true,
-                    arrange = ui.ALIGNMENT.Center,
-                    align = ui.ALIGNMENT.Center,
-                },
-                content = ui.content(menuContent),
-            },
-        },
+    createMenu{
+        header = { type = 'bare', text = "Dwemer Enchanting Machine", size = 30 },
+        info = "Soul Power: " .. math.floor(soulPower),
+        items = items,
     }
-
-    print("[EnchantMachine] Created main menu")
-    currentMenu = menu
 end
 
--- Update loop
-local function onUpdate(dt)
-    -- Update soul power display in settings
-    updateTimer = updateTimer + dt
-    if updateTimer >= updateInterval then
-        updateTimer = 0
-        local soulPower = getSoulPower()
-        statusSettings:set('soulPowerDisplay', tostring(math.floor(soulPower)))
-    end
-end
-
--- Key press handler
-local function onKeyPress(key)
-    -- Close menu on ESC
-    if key.symbol == 'Escape' and currentMenu then
-        closeMenu()
-        return
-    end
-end
-
--- Event handler for results from global script
-local function onMachineResult(eventData)
-    if eventData.success then
-        ui.showMessage(eventData.message)
-    else
-        ui.showMessage("Error: " .. eventData.message)
-    end
-
-    -- Reopen main menu after operation completes
-    async:newUnsavableSimulationTimer(1.5, function()
-        createMainMenu()
-    end)
-end
-
--- Boss spawn detection: track cell changes
-local lastCellName = nil
-local BOSS_CELL_NAME = "Arkngthand, Deep Ore Passage"
-local bossSpawnRequested = false
+-- ---------- Boss cell detection ----------
 
 local function checkBossCellEntry()
-    -- Get current cell name
-    local currentCell = self.object.cell
-    if not currentCell then return end
+    local cell = self.object.cell
+    if not cell then return end
 
-    local currentCellName = currentCell.name or ""
+    local currentCellName = cell.name or ""
+    if currentCellName == lastCellName then return end
+    lastCellName = currentCellName
 
-    -- Check if cell changed
-    if currentCellName ~= lastCellName then
-        print("[EnchantMachine] Player changed cells: " .. currentCellName)
-        lastCellName = currentCellName
-
-        -- Check if entered boss cell
-        if not bossSpawnRequested and currentCellName == BOSS_CELL_NAME then
-            print("[EnchantMachine] Player entered boss cell! Requesting spawn...")
-            bossSpawnRequested = true
-            core.sendGlobalEvent('EnchantMachine_SpawnBoss', {})
-        end
+    if not bossSpawnRequested and currentCellName == BOSS_CELL_NAME then
+        bossSpawnRequested = true
+        core.sendGlobalEvent('EnchantMachine_SpawnBoss', {})
     end
+end
+
+-- Start EM_DwemerDiscovery at stage 10 once the player is carrying the Dwemer
+-- scroll (encoded or, after Baladas's swap, decoded). Self-healing across loads:
+-- if the quest is already at/past stage 10 we just stop polling. addJournalEntry
+-- is a no-op if the omwaddon lacks an entry at the stage. Called throttled (~1s).
+local function checkScrollLooted()
+    if scrollJournalDone then return end
+
+    local quest = types.Player.quests(self.object)[SCROLL_QUEST_ID]
+    if quest and (quest.stage or 0) >= SCROLL_LOOTED_STAGE then
+        scrollJournalDone = true
+        return
+    end
+
+    local inv = types.Actor.inventory(self.object)
+    if inv:countOf(SCROLL_ITEM_ENCODED) > 0 or inv:countOf(SCROLL_ITEM_DECODED) > 0 then
+        quest:addJournalEntry(SCROLL_LOOTED_STAGE)
+        scrollJournalDone = true
+    end
+end
+
+-- ---------- Engine handlers ----------
+
+local function onUpdate(dt)
+    checkBossCellEntry()
+
+    updateTimer = updateTimer + dt
+    if updateTimer >= UPDATE_INTERVAL then
+        updateTimer = 0
+        statusSettings:set('soulPowerDisplay', tostring(math.floor(getSoulPower())))
+        checkScrollLooted()
+    end
+end
+
+local function onKeyPress(key)
+    if key.symbol == 'Escape' and currentMenu then
+        closeMenu()
+    end
+end
+
+local function onSave()
+    return {
+        version = 1,
+        bossSpawnRequested = bossSpawnRequested,
+    }
+end
+
+local function onLoad(data)
+    if data and data.version then
+        bossSpawnRequested = data.bossSpawnRequested or false
+    else
+        bossSpawnRequested = false
+    end
+    -- One sync at load — subscribe() only fires on subsequent changes.
+    syncSettingsToGlobal()
 end
 
 print("[EnchantMachine] Player script loaded successfully")
 
 return {
     engineHandlers = {
-        onUpdate = function(dt)
-            checkBossCellEntry()
-            onUpdate(dt)
-        end,
+        onUpdate = onUpdate,
         onKeyPress = onKeyPress,
-        onInactive = function()
-            closeMenu()
-        end,
+        onSave = onSave,
+        onLoad = onLoad,
+        onInactive = closeMenu,
     },
     eventHandlers = {
-        EnchantMachine_Result = onMachineResult,
-        EnchantMachine_OpenMenu = function(eventData)
-            print("[EnchantMachine] Received OpenMenu event!")
+        EnchantMachine_Result = function(eventData)
+            if eventData.success then
+                ui.showMessage(eventData.message)
+            else
+                ui.showMessage("Error: " .. eventData.message)
+            end
+            -- Reopen the sub-menu the action came from so the player can act on
+            -- the rest of the stack/list. Each sub-menu self-redirects to the main
+            -- menu when its list is empty, so this is safe when nothing is left.
+            local reopen = createMainMenu
+            if eventData.operation == 'deposit' then
+                reopen = showDepositMenu
+            elseif eventData.operation == 'recharge' then
+                reopen = showRechargeMenu
+            elseif eventData.operation == 'upgrade' then
+                reopen = showUpgradeMenu
+            end
+            async:newUnsavableSimulationTimer(1.5, function() reopen() end)
+        end,
+        EnchantMachine_OpenMenu = function()
             ui.showMessage("The ancient Dwemer machine hums to life, its crystalline interface beginning to shimmer with ethereal light...")
-
-            -- Brief delay for atmospheric effect
             async:newUnsavableSimulationTimer(1.5, function()
-                local ok, err = pcall(function()
-                    createMainMenu()
-                end)
+                local ok, err = pcall(createMainMenu)
                 if not ok then
                     print("[EnchantMachine] ERROR creating menu:", err)
                     ui.showMessage("The machine sputters and falls silent... Something went wrong.")
-                else
-                    print("[EnchantMachine] Menu opened successfully!")
                 end
             end)
         end,
-        -- KEY FIX: OpenMW fires this when UI mode changes (e.g., ESC pressed)
+        -- OpenMW fires this when UI mode changes (e.g., ESC pressed).
+        -- When mode becomes nil, Interface mode was exited.
         UiModeChanged = function(data)
-            -- When mode becomes nil, Interface mode was exited (ESC pressed)
             if currentMenu and data.newMode == nil then
-                print("[EnchantMachine] UI mode exited (ESC pressed), cleaning up menu")
                 closeMenu()
             end
         end,

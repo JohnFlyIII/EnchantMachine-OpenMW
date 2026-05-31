@@ -84,7 +84,13 @@ See `STORY_DISCOVERY.md` for alternative spawn locations and detailed instructio
 
 **Alternative: Skip the Boss (For Testing)**
 
-If you want to start using the machine immediately, you can spawn the remote with console commands. See `give_remote.lua` helper script for details.
+If you want to start using the machine immediately, open the console and run:
+
+```
+luags lua sendGlobalEvent('EnchantMachine_GiveRemote', {})
+```
+
+This adds the remote directly to your inventory (handler in `global.lua`).
 
 ### Using the Machine
 
@@ -113,18 +119,22 @@ If you want to start using the machine immediately, you can spawn the remote wit
 Access mod settings in OpenMW under: **Settings → Scripts → Dwemer Enchanting Machine**
 
 - **Enable Machine**: Turn the entire system on/off
-- **Upgrade Cost Ratio**: Soul power cost per capacity point (10-1000, default: 100:1)
+- **Enchant Multiplier**: Display multiplier hint for enchantment capacity (1-100, default: 10x)
+- **Upgrade Ratio**: Soul power cost per capacity point (1-1000, default: 100:1)
   - Lower = cheaper upgrades, higher = more expensive upgrades
-- **Enable Item Upgrades**: Toggle the upgrade feature (can be quest-locked in future)
+- **Enable Upgrades**: Toggle the upgrade feature (can be quest-locked in future)
 
 ## Technical Details
 
 ### Architecture
 
-- **global.lua**: Manages soul bank, item upgrades, settings, and data persistence
-- **player_full.lua**: Player script for UI, inventory interaction, and remote control
-- **spawn_researcher.lua**: Boss encounter system
-- **debug.lua**: Debug and logging system
+- **global.lua**: GLOBAL script — soul bank, item upgrades, settings sync, save/load, remote-item handler
+- **player_full.lua**: PLAYER script — UI menus, settings page, inventory scanning, boss-cell detection
+- **machine.lua**: CUSTOM script — attached to in-world activators (optional), forwards activation to the player
+- **spawn_researcher.lua**: GLOBAL script — one-time boss encounter spawn
+- **debug.lua**: GLOBAL script — logging, metrics, and performance tools
+
+See `DEVELOPER_GUIDE.md` for the full architecture, event protocol, and storage section layout.
 
 ### How Upgrades Work
 
