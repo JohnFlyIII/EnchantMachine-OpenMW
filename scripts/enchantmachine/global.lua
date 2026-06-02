@@ -73,6 +73,12 @@ end
 local soulPower = 0
 local upgradedItems = {}
 local itemBaseRecords = {}  -- Maps upgraded item ID -> original base record ID
+local attuned = false       -- Set once the resonator is attuned at the Heart (Attune feature)
+
+-- The interior cell holding the Heart of Lorkhan in Dagoth Ur's facility. Attune
+-- only succeeds while the player stands here; the vanilla cell name is matched
+-- exactly (verify in-game with `player.cell.name` if this ever drifts).
+local FINAL_CHAMBER_CELL = "Akulakhan's Chamber"
 
 -- Upgrade tracking (declared early so getItemCapacity / upgradeItemCapacity can both use them)
 local function getUpgradedCapacity(itemRecordId)
@@ -92,6 +98,7 @@ local settingsData = storage.globalSection('EnchantMachine_Settings')
 -- Update shared storage when soul power changes (for UI display)
 local function updateSharedData()
     sharedData:set('soulPower', soulPower)
+    sharedData:set('attuned', attuned)
 end
 
 -- Default settings (fallback values)
@@ -367,6 +374,72 @@ local function upgradeItemCapacity(item, capacityIncrease, actor, settings)
     return true, "Upgraded " .. record.name .. " capacity from " .. math.floor(record.enchantCapacity) .. " to " .. math.floor(newCapacity) .. ". Soul power remaining: " .. math.floor(newTotal)
 end
 
+-- Remove an item's enchantment by registering a derived record with the enchant
+-- cleared and swapping the inventory item to it. Refunds soul power based on the
+-- removed enchantment's charge (consistent with recharge: 1 power per charge point).
+-- The resulting blank item can then be enchanted via the game's own enchant system
+-- (or upgraded via this machine, which only accepts unenchanted items).
+local function removeEnchantment(item, actor, settings)
+    dbg.startTimer("removeEnchantment")
+
+    settings = settings or getSettings()
+    if not settings.enableMachine then
+        dbg.endTimer("removeEnchantment")
+        return false, "The machine is disabled"
+    end
+
+    local record, oldData, typeMod = getEnchantable(item)
+    if not record then
+        dbg.endTimer("removeEnchantment")
+        return false, "Only weapons, armor, and clothing can be modified"
+    end
+    if not record.enchant or record.enchant == "" then
+        dbg.endTimer("removeEnchantment")
+        return false, "Item is not enchanted"
+    end
+
+    -- Refund value from the enchantment's charge capacity, falling back to its cost.
+    local ench = core.magic.enchantments.records[record.enchant]
+    local refund = 0
+    if ench then
+        local charge = ench.charge or 0
+        refund = math.floor(charge > 0 and charge or (ench.cost or 0))
+    end
+
+    -- Preserve the base-record mapping so later capacity upgrades still resolve.
+    local baseRecordId = itemBaseRecords[item.recordId] or item.recordId
+
+    -- world.createRecord auto-generates the id (draft.id is ignored), so register
+    -- fresh and trust the returned id — same pattern as upgradeItemCapacity.
+    local draft = typeMod.createRecordDraft({ template = record, enchant = "" })
+    local newRecordId = world.createRecord(draft).id
+    itemBaseRecords[newRecordId] = baseRecordId
+
+    local newItem = world.createObject(newRecordId, 1)
+
+    -- Carry over condition. enchantmentCharge is meaningless now (no enchant), so skip it.
+    local newData = typeMod.itemData(newItem)
+    if oldData and newData and oldData.condition then
+        newData.condition = oldData.condition
+    end
+
+    if actor and types.Actor.objectIsInstance(actor) then
+        newItem:moveInto(types.Actor.inventory(actor))
+    end
+    -- Consume one item from the stack; we only created one replacement.
+    item:remove(1)
+
+    if refund > 0 then addSoulPower(refund) end
+
+    dbg.info("RemoveEnchant", "Removed enchant from " .. (record.name or "item") .. ", refunded " .. refund)
+    dbg.incrementMetric("totalEnchantRemovals")
+    dbg.endTimer("removeEnchantment")
+
+    return true, string.format(
+        "Removed the enchantment from %s. Refunded %d soul power. The item can now be enchanted normally.",
+        record.name or "item", refund)
+end
+
 -- Calculate effective enchantment capacity for new enchantments
 local function getEffectiveEnchantCapacity(item)
     local settings = getSettings()
@@ -401,10 +474,11 @@ end
 local function onSave()
     dbg.info("Save", "Saving soul power: " .. soulPower)
     return {
-        version = 2,
+        version = 3,
         soulPower = soulPower,
         upgradedItems = upgradedItems,
         itemBaseRecords = itemBaseRecords,
+        attuned = attuned,
     }
 end
 
@@ -413,11 +487,14 @@ local function onLoad(data)
         soulPower = data.soulPower or 0
         upgradedItems = data.upgradedItems or {}
         itemBaseRecords = data.itemBaseRecords or {}
+        -- attuned added in v3; older saves default to false.
+        attuned = data.attuned or false
         dbg.info("Load", "Loaded soul power " .. soulPower)
     else
         soulPower = 0
         upgradedItems = {}
         itemBaseRecords = {}
+        attuned = false
         dbg.info("Load", "New game, starting at 0 soul power")
     end
 
@@ -469,6 +546,35 @@ local function onUpgradeItemEvent(eventData)
     end, eventData)
 end
 
+local function onRemoveEnchantEvent(eventData)
+    handleOperationEvent('remove-enchant', removeEnchantment, eventData)
+end
+
+-- Attune the resonator. Unlike the other operations this acts on a location, not
+-- an inventory item, so it bypasses handleOperationEvent (which requires `item`).
+-- Succeeds only inside the Heart chamber; sets the persistent `attuned` flag.
+local function onAttuneEvent(eventData)
+    local actor = eventData and eventData.actor
+    if not actor then return end
+
+    local cell = actor.cell
+    local ok = cell ~= nil and cell.name == FINAL_CHAMBER_CELL
+    if ok then
+        attuned = true
+        updateSharedData()
+        dbg.info("Attune", "Resonator attuned at " .. FINAL_CHAMBER_CELL)
+    else
+        dbg.info("Attune", "Attune failed in cell " .. ((cell and cell.name) or "?"))
+    end
+
+    actor:sendEvent('EnchantMachine_Result', {
+        success = ok,
+        operation = 'attune',
+        message = ok and "The resonator sings in answer to the Heart. Attunement complete."
+            or "The device failed to attune.",
+    })
+end
+
 -- Export interface for other scripts
 return {
     interfaceName = 'EnchantMachine',
@@ -489,9 +595,13 @@ return {
 
         -- Item operations
         rechargeItem = rechargeItem,
+        removeEnchantment = removeEnchantment,
         canBeEnchanted = canBeEnchanted,
         getItemCapacity = getItemCapacity,
         getEffectiveEnchantCapacity = getEffectiveEnchantCapacity,
+
+        -- Attunement
+        getAttuned = function() return attuned end,
 
         -- Upgrade operations
         getUpgradedCapacity = getUpgradedCapacity,
@@ -509,6 +619,8 @@ return {
         EnchantMachine_DepositGem = onDepositGemEvent,
         EnchantMachine_RechargeItem = onRechargeItemEvent,
         EnchantMachine_UpgradeItem = onUpgradeItemEvent,
+        EnchantMachine_RemoveEnchant = onRemoveEnchantEvent,
+        EnchantMachine_Attune = onAttuneEvent,
 
         -- PLAYER pushes its current settings here so machine.getSettings() (the
         -- documented public API) returns what the user actually configured,

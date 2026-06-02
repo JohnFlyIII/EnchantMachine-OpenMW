@@ -125,6 +125,9 @@ local showDepositMenu
 local showRechargeMenu
 local showUpgradeMenu
 local showUpgradeAmountMenu
+local showRemoveEnchantMenu
+local openNativeEnchantMenu
+local attuneResonator
 
 -- ---------- Settings sync (PLAYER -> GLOBAL) ----------
 
@@ -386,6 +389,18 @@ local function getUpgradeableItems()
     return items
 end
 
+-- Enchanted weapons/armor/clothing — candidates for Remove Enchantment.
+local function getEnchantedItems()
+    local items = {}
+    for _, item in ipairs(types.Actor.inventory(self):getAll()) do
+        local record = getEnchantableRecord(item)
+        if record and record.enchant and record.enchant ~= "" then
+            table.insert(items, { item = item, record = record })
+        end
+    end
+    return items
+end
+
 -- ---------- Menu definitions ----------
 
 showDepositMenu = function()
@@ -547,6 +562,60 @@ showUpgradeAmountMenu = function(entry, ratio, soulPower)
     }
 end
 
+showRemoveEnchantMenu = function()
+    closeMenu()
+
+    local enchanted = getEnchantedItems()
+    if #enchanted == 0 then
+        ui.showMessage("You have no enchanted items.")
+        async:newUnsavableSimulationTimer(1.5, function() createMainMenu() end)
+        return
+    end
+
+    local items = {}
+    for _, entry in ipairs(enchanted) do
+        local itemName = entry.record.name or "Item"
+        table.insert(items, createButton(
+            itemName,
+            function()
+                core.sendGlobalEvent('EnchantMachine_RemoveEnchant', {
+                    actor = self.object,
+                    item = entry.item,
+                    settings = getSettings(),
+                })
+                ui.showMessage("Removing enchantment...")
+                closeMenu()
+            end
+        ))
+    end
+
+    createMenu{
+        header = { type = 'boxed', text = "Remove Enchantment" },
+        info = "Strips an item's enchantment and refunds soul power.",
+        warning = "The item can then be enchanted normally (or have its capacity upgraded here).",
+        items = items,
+        onBack = function() createMainMenu() end,
+    }
+end
+
+-- "Add Enchantment" hands off to the game's own enchanting window so the player
+-- selects from known spells with vanilla cost rules. Self-enchanting needs a
+-- filled soul gem in the inventory; we surface that hint and let the engine drive.
+openNativeEnchantMenu = function()
+    closeMenu()
+    local ok = pcall(function() I.UI.addMode('Enchanting') end)
+    if not ok then
+        ui.showMessage("This version of the engine could not open the enchanting menu. Use a filled soul gem at an enchanter instead.")
+        async:newUnsavableSimulationTimer(2.0, function() createMainMenu() end)
+    end
+end
+
+attuneResonator = function()
+    closeMenu()
+    core.sendGlobalEvent('EnchantMachine_Attune', { actor = self.object })
+    ui.showMessage("The resonator reaches outward...")
+end
+
 createMainMenu = function()
     closeMenu()
 
@@ -556,12 +625,15 @@ createMainMenu = function()
     local items = {}
     table.insert(items, createButton("Deposit Soul Gems", showDepositMenu))
     table.insert(items, createButton("Recharge Enchanted Items", showRechargeMenu))
+    table.insert(items, createButton("Add Enchantment", openNativeEnchantMenu))
+    table.insert(items, createButton("Remove Enchantment", showRemoveEnchantMenu))
     if settings.enableUpgradeFeature then
         table.insert(items, createButton("Upgrade Item Capacity", showUpgradeMenu))
     else
         table.insert(items, textLine("[Upgrade Capacity - Locked]",
             { size = 18, color = util.color.rgb(0.5, 0.5, 0.5) }))
     end
+    table.insert(items, createButton("Attune Resonator", attuneResonator))
     table.insert(items, spacer(20))
     table.insert(items, createButton("Exit", closeMenu))
 
@@ -671,7 +743,10 @@ return {
                 reopen = showRechargeMenu
             elseif eventData.operation == 'upgrade' then
                 reopen = showUpgradeMenu
+            elseif eventData.operation == 'remove-enchant' then
+                reopen = showRemoveEnchantMenu
             end
+            -- 'attune' (and any unknown op) falls through to the main menu.
             async:newUnsavableSimulationTimer(1.5, function() reopen() end)
         end,
         EnchantMachine_OpenMenu = function()

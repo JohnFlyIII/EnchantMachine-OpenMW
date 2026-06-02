@@ -24,6 +24,11 @@ The result: Create enchanted items with 10x, 50x, or even 100x the normal capaci
   - Then enchant them normally at any enchanter for vastly more powerful enchantments
   - Stack multiple upgrades on the same item for extreme capacity
   - Works with vanilla enchanting mechanics - no API limitations!
+- **Remove Enchantment**: Strip the enchantment from any enchanted weapon, armor, or clothing
+  - Refunds soul power based on the enchantment's charge
+  - Frees pre-enchanted artifacts to be re-enchanted via the normal enchanting system (or upgraded here first)
+- **Add Enchantment**: Opens the game's native enchanting menu — pick from your known spells with standard cost rules *(requires a filled soul gem; pending verification on some engine builds)*
+- **Attune Resonator**: Attunes the device to the Heart of Lorkhan — only succeeds within the final Dagoth Ur chamber (`Akulakhan's Chamber`); sets a persistent attunement flag
 
 ### Technical Features ✅
 - **No ESP Required**: Pure Lua + omwaddon implementation
@@ -98,7 +103,10 @@ This adds the remote directly to your inventory (handler in `global.lua`).
 2. The ancient machine interface appears with options:
    - **Deposit Soul Gems**: Convert filled soul gems into stored soul power
    - **Recharge Item**: Restore charges to enchanted items (1 soul power per charge point)
+   - **Add Enchantment**: Open the game's native enchanting menu to enchant from your known spells
+   - **Remove Enchantment**: Strip an item's enchantment and refund soul power
    - **Upgrade Item Capacity**: Permanently increase an unenchanted item's enchantment capacity
+   - **Attune Resonator**: Attune to the Heart (only works in the final Dagoth Ur chamber)
 3. **After upgrading an item**, visit any enchanter in Morrowind to create incredibly powerful enchantments!
 
 **Important Notes**:
