@@ -4,6 +4,7 @@
 local storage = require('openmw.storage')
 local core = require('openmw.core')
 local types = require('openmw.types')
+local util = require('openmw.util')
 local world = require('openmw.world')
 local I = require('openmw.interfaces')
 
@@ -60,6 +61,13 @@ end
 -- renamed misc item built via createRecordDraft — we instantiate it directly.
 local DWEMER_SCROLL_ENCODED_ID = "em_dwemer_scroll_encoded"
 
+local CAPTURE_MARK_EFFECT_ID = "em_capture_mark"
+local CAPTURE_MARK_SPELL_ID = "em_capture_mark_spell"
+local SUMMON_EFFECT_ID = "em_summon_echo"
+local SUMMON_DURATION = 60
+local SUMMON_POLL_INTERVAL = 0.5
+local SUMMON_SCRIPT = "scripts/enchantmachine/summoned.lua"
+
 -- Create a fresh encoded-scroll instance. Returns (object) or (nil, err) if the
 -- omwaddon record is missing (e.g. plugin not loaded / id changed in CS).
 local function createDwemerScroll()
@@ -74,11 +82,25 @@ local soulPower = 0
 local upgradedItems = {}
 local itemBaseRecords = {}  -- Maps upgraded item ID -> original base record ID
 local attuned = false       -- Set once the resonator is attuned at the Heart (Attune feature)
+local summonSpells = {}     -- Maps generated summon spell ID -> captured creature metadata
+local summonPollTimer = 0
 
 -- The interior cell holding the Heart of Lorkhan in Dagoth Ur's facility. Attune
 -- only succeeds while the player stands here; the vanilla cell name is matched
 -- exactly (verify in-game with `player.cell.name` if this ever drifts).
 local FINAL_CHAMBER_CELL = "Akulakhan's Chamber"
+
+local function isValidObject(object)
+    if not object then return false end
+    local ok, valid = pcall(function() return object:isValid() end)
+    return ok and valid
+end
+
+local function resolveBaseRecordId(item)
+    return itemBaseRecords[item.recordId]
+        or item.recordId:match("^(.-)_cap%d+$")
+        or item.recordId
+end
 
 -- Upgrade tracking (declared early so getItemCapacity / upgradeItemCapacity can both use them)
 local function getUpgradedCapacity(itemRecordId)
@@ -86,7 +108,22 @@ local function getUpgradedCapacity(itemRecordId)
 end
 
 local function setUpgradedCapacity(itemRecordId, additionalCapacity)
-    upgradedItems[itemRecordId] = additionalCapacity
+    if additionalCapacity and additionalCapacity > 0 then
+        upgradedItems[itemRecordId] = additionalCapacity
+    else
+        upgradedItems[itemRecordId] = nil
+    end
+end
+
+local function getItemUpgradeAmount(item, record, typeMod)
+    local baseRecordId = resolveBaseRecordId(item)
+    local baseRecord = typeMod.records[baseRecordId] or record
+    local baseCapacity = baseRecord.enchantCapacity or record.enchantCapacity or 0
+    local storedUpgrade = getUpgradedCapacity(item.recordId)
+    if storedUpgrade > 0 then
+        return storedUpgrade, baseRecordId, baseCapacity
+    end
+    return math.max(0, (record.enchantCapacity or baseCapacity) - baseCapacity), baseRecordId, baseCapacity
 end
 
 -- Shared storage for PLAYER script to read (just a display cache)
@@ -273,15 +310,15 @@ local function rechargeItem(item, actor, settings)
     end
 
     local soulPowerNeeded = math.ceil(maxCharge - currentCharge) -- 1:1 ratio
-    local success, remaining = subtractSoulPower(soulPowerNeeded)
-    if not success then
-        return false, "Not enough soul power (need " .. soulPowerNeeded .. ", have " .. remaining .. ")"
-    end
-
     if not itemData then
         dbg.error("Recharge", "Item has no itemData - cannot set charge")
         dbg.endTimer("rechargeItem")
         return false, "Item cannot store charge data"
+    end
+
+    local success, remaining = subtractSoulPower(soulPowerNeeded)
+    if not success then
+        return false, "Not enough soul power (need " .. soulPowerNeeded .. ", have " .. remaining .. ")"
     end
 
     itemData.enchantmentCharge = maxCharge
@@ -326,52 +363,53 @@ local function upgradeItemCapacity(item, capacityIncrease, actor, settings)
 
     local ratio = settings.upgradeRatio or 100
     local soulCost = capacityIncrease * ratio
-    local success, newTotal = subtractSoulPower(soulCost)
-    if not success then
+    if soulPower < soulCost then
         dbg.endTimer("upgradeItemCapacity")
-        return false, "Not enough soul power (need " .. soulCost .. ", have " .. newTotal .. ")"
+        return false, "Not enough soul power (need " .. soulCost .. ", have " .. soulPower .. ")"
     end
 
-    -- Walk back to the original base record. The pattern-match fallback handles
-    -- items from older save formats that pre-date itemBaseRecords.
-    local baseRecordId = itemBaseRecords[item.recordId]
-        or item.recordId:match("^(.-)_cap%d+$")
-        or item.recordId
+    local _existingUpgrade, baseRecordId, baseCapacity = getItemUpgradeAmount(item, record, typeMod)
+    local oldCapacity = record.enchantCapacity or baseCapacity
+    local newCapacity = oldCapacity + capacityIncrease
 
-    local baseRecord = typeMod.records[baseRecordId]
-    local baseCapacity = baseRecord.enchantCapacity
-    local currentUpgrade = getUpgradedCapacity(baseRecordId)
-    local newCapacity = baseCapacity + currentUpgrade + capacityIncrease
+    local ok, result = pcall(function()
+        -- world.createRecord auto-generates the id (the draft.id field is ignored),
+        -- so we always register a fresh record and trust the returned id.
+        local draft = typeMod.createRecordDraft({ template = record, enchantCapacity = newCapacity })
+        local newRecordId = world.createRecord(draft).id
+        local newItem = world.createObject(newRecordId, 1)
 
-    -- world.createRecord auto-generates the id (the draft.id field is ignored),
-    -- so we always register a fresh record and trust the returned id.
-    local draft = typeMod.createRecordDraft({ template = record, enchantCapacity = newCapacity })
-    local newRecordId = world.createRecord(draft).id
-    itemBaseRecords[newRecordId] = baseRecordId
+        -- Carry over condition and remaining enchant charge.
+        local oldData = typeMod.itemData(item)
+        local newData = typeMod.itemData(newItem)
+        if oldData and newData then
+            if oldData.condition then newData.condition = oldData.condition end
+            if oldData.enchantmentCharge then newData.enchantmentCharge = oldData.enchantmentCharge end
+        end
 
-    local newItem = world.createObject(newRecordId, 1)
+        if actor and types.Actor.objectIsInstance(actor) then
+            newItem:moveInto(types.Actor.inventory(actor))
+        end
+        -- Consume one item from the stack; we only created one upgraded replacement.
+        item:remove(1)
 
-    -- Carry over condition and remaining enchant charge.
-    local oldData = typeMod.itemData(item)
-    local newData = typeMod.itemData(newItem)
-    if oldData and newData then
-        if oldData.condition then newData.condition = oldData.condition end
-        if oldData.enchantmentCharge then newData.enchantmentCharge = oldData.enchantmentCharge end
+        return { newRecordId = newRecordId }
+    end)
+    if not ok then
+        dbg.error("Upgrade", "Record swap failed", tostring(result))
+        dbg.endTimer("upgradeItemCapacity")
+        return false, "The machine could not upgrade that item"
     end
 
-    if actor and types.Actor.objectIsInstance(actor) then
-        newItem:moveInto(types.Actor.inventory(actor))
-    end
-    -- Consume one item from the stack; we only created one upgraded replacement.
-    item:remove(1)
-
-    setUpgradedCapacity(baseRecordId, newCapacity - baseCapacity)
+    local _success, newTotal = subtractSoulPower(soulCost)
+    itemBaseRecords[result.newRecordId] = baseRecordId
+    setUpgradedCapacity(result.newRecordId, newCapacity - baseCapacity)
 
     dbg.info("Upgrade", "Upgraded " .. record.name .. " " .. baseCapacity .. " -> " .. newCapacity .. " (base " .. baseRecordId .. ")")
     dbg.incrementMetric("totalUpgrades")
     dbg.endTimer("upgradeItemCapacity")
 
-    return true, "Upgraded " .. record.name .. " capacity from " .. math.floor(record.enchantCapacity) .. " to " .. math.floor(newCapacity) .. ". Soul power remaining: " .. math.floor(newTotal)
+    return true, "Upgraded " .. record.name .. " capacity from " .. math.floor(oldCapacity) .. " to " .. math.floor(newCapacity) .. ". Soul power remaining: " .. math.floor(newTotal)
 end
 
 -- Remove an item's enchantment by registering a derived record with the enchant
@@ -407,27 +445,37 @@ local function removeEnchantment(item, actor, settings)
     end
 
     -- Preserve the base-record mapping so later capacity upgrades still resolve.
-    local baseRecordId = itemBaseRecords[item.recordId] or item.recordId
+    local existingUpgrade, baseRecordId = getItemUpgradeAmount(item, record, typeMod)
 
-    -- world.createRecord auto-generates the id (draft.id is ignored), so register
-    -- fresh and trust the returned id — same pattern as upgradeItemCapacity.
-    local draft = typeMod.createRecordDraft({ template = record, enchant = "" })
-    local newRecordId = world.createRecord(draft).id
-    itemBaseRecords[newRecordId] = baseRecordId
+    local ok, result = pcall(function()
+        -- world.createRecord auto-generates the id (draft.id is ignored), so register
+        -- fresh and trust the returned id — same pattern as upgradeItemCapacity.
+        local draft = typeMod.createRecordDraft({ template = record, enchant = "" })
+        local newRecordId = world.createRecord(draft).id
+        local newItem = world.createObject(newRecordId, 1)
 
-    local newItem = world.createObject(newRecordId, 1)
+        -- Carry over condition. enchantmentCharge is meaningless now (no enchant), so skip it.
+        local newData = typeMod.itemData(newItem)
+        if oldData and newData and oldData.condition then
+            newData.condition = oldData.condition
+        end
 
-    -- Carry over condition. enchantmentCharge is meaningless now (no enchant), so skip it.
-    local newData = typeMod.itemData(newItem)
-    if oldData and newData and oldData.condition then
-        newData.condition = oldData.condition
+        if actor and types.Actor.objectIsInstance(actor) then
+            newItem:moveInto(types.Actor.inventory(actor))
+        end
+        -- Consume one item from the stack; we only created one replacement.
+        item:remove(1)
+
+        return { newRecordId = newRecordId }
+    end)
+    if not ok then
+        dbg.error("RemoveEnchant", "Record swap failed", tostring(result))
+        dbg.endTimer("removeEnchantment")
+        return false, "The machine could not remove that enchantment"
     end
 
-    if actor and types.Actor.objectIsInstance(actor) then
-        newItem:moveInto(types.Actor.inventory(actor))
-    end
-    -- Consume one item from the stack; we only created one replacement.
-    item:remove(1)
+    itemBaseRecords[result.newRecordId] = baseRecordId
+    setUpgradedCapacity(result.newRecordId, existingUpgrade)
 
     if refund > 0 then addSoulPower(refund) end
 
@@ -517,15 +565,15 @@ local function addEnchantment(item, actor, settings, eventData)
     local castCost = math.max(1, math.floor(spell.cost or 1))
 
     -- Charge the bank for filling the enchantment to full (1 power per charge point).
-    local success, remaining = subtractSoulPower(charge)
-    if not success then
+    if soulPower < charge then
         dbg.endTimer("addEnchantment")
-        return false, "Not enough soul power (need " .. charge .. ", have " .. remaining .. ")"
+        return false, "Not enough soul power (need " .. charge .. ", have " .. soulPower .. ")"
     end
 
     -- Build the enchantment record, then a derived item record pointing at it.
-    -- Guard creation: a bad effect set should refund and report, not hard-error.
-    local ok, enchOrErr = pcall(function()
+    -- Guard creation: a bad effect set should report, not hard-error or charge the bank.
+    local existingUpgrade, baseRecordId = getItemUpgradeAmount(item, record, typeMod)
+    local ok, result = pcall(function()
         local enchDraft = core.magic.enchantments.createRecordDraft({
             type = enchType,
             isAutocalc = false,
@@ -533,35 +581,39 @@ local function addEnchantment(item, actor, settings, eventData)
             charge = charge,
             effects = effects,
         })
-        return world.createRecord(enchDraft).id
+        local enchId = world.createRecord(enchDraft).id
+
+        local draft = typeMod.createRecordDraft({ template = record, enchant = enchId })
+        local newRecordId = world.createRecord(draft).id
+        local newItem = world.createObject(newRecordId, 1)
+
+        -- Carry over condition; the new item arrives fully charged.
+        local newData = typeMod.itemData(newItem)
+        if newData then
+            if oldData and oldData.condition then newData.condition = oldData.condition end
+            newData.enchantmentCharge = charge
+        end
+
+        if actor and types.Actor.objectIsInstance(actor) then
+            newItem:moveInto(types.Actor.inventory(actor))
+        end
+        -- Consume one item from the stack; we only created one replacement.
+        item:remove(1)
+
+        return {
+            enchId = enchId,
+            newRecordId = newRecordId,
+        }
     end)
     if not ok then
-        addSoulPower(charge)  -- refund
-        dbg.error("AddEnchant", "Enchantment creation failed", tostring(enchOrErr))
+        dbg.error("AddEnchant", "Record swap failed", tostring(result))
         dbg.endTimer("addEnchantment")
         return false, "The machine could not imbue that enchantment"
     end
-    local enchId = enchOrErr
 
-    local baseRecordId = itemBaseRecords[item.recordId] or item.recordId
-    local draft = typeMod.createRecordDraft({ template = record, enchant = enchId })
-    local newRecordId = world.createRecord(draft).id
-    itemBaseRecords[newRecordId] = baseRecordId
-
-    local newItem = world.createObject(newRecordId, 1)
-
-    -- Carry over condition; the new item arrives fully charged.
-    local newData = typeMod.itemData(newItem)
-    if newData then
-        if oldData and oldData.condition then newData.condition = oldData.condition end
-        newData.enchantmentCharge = charge
-    end
-
-    if actor and types.Actor.objectIsInstance(actor) then
-        newItem:moveInto(types.Actor.inventory(actor))
-    end
-    -- Consume one item from the stack; we only created one replacement.
-    item:remove(1)
+    local _success, remaining = subtractSoulPower(charge)
+    itemBaseRecords[result.newRecordId] = baseRecordId
+    setUpgradedCapacity(result.newRecordId, existingUpgrade)
 
     dbg.info("AddEnchant", "Enchanted " .. (record.name or "item") .. " with " .. (spell.name or spellId) .. " (charge " .. charge .. ")")
     dbg.incrementMetric("totalEnchantsAdded")
@@ -578,6 +630,179 @@ local function getEffectiveEnchantCapacity(item)
     local baseCapacity = getItemCapacity(item)
     local multiplier = settings.enchantMultiplier or 10
     return baseCapacity * multiplier
+end
+
+local function getSpellForCreature(creatureId)
+    for spellId, info in pairs(summonSpells) do
+        if info.creatureId == creatureId then
+            return spellId, info
+        end
+    end
+end
+
+local function createSummonSpell(creatureId, creatureName)
+    local spellName = "Summon " .. creatureName
+    local draft = core.magic.spells.createRecordDraft({
+        name = spellName,
+        type = core.magic.SPELL_TYPE.Spell,
+        cost = 25,
+        isAutocalc = false,
+        starterSpellFlag = false,
+        effects = {
+            {
+                id = SUMMON_EFFECT_ID,
+                range = core.magic.RANGE.Self,
+                area = 0,
+                duration = SUMMON_DURATION,
+            },
+        },
+    })
+    return world.createRecord(draft).id, spellName
+end
+
+local function markCreature(target, actor, settings)
+    settings = settings or getSettings()
+    if not settings.enableMachine then
+        return false, "The machine is disabled"
+    end
+    if not isValidObject(actor) or not types.Player.objectIsInstance(actor) then
+        return false, "Only the player can bind a summon"
+    end
+    if not isValidObject(target) or not types.Creature.objectIsInstance(target) then
+        return false, "Only creatures can be marked for summoning"
+    end
+    if types.Actor.isDead(target) then
+        return false, "That creature is already dead"
+    end
+    if types.Actor.activeSpells(target):isSpellActive(CAPTURE_MARK_SPELL_ID) then
+        return false, "That creature is already marked"
+    end
+
+    local record = types.Creature.record(target)
+    local creatureName = (record and record.name and record.name ~= "" and record.name) or target.recordId
+    local ok, err = pcall(function()
+        types.Actor.activeSpells(target):add({
+            id = CAPTURE_MARK_SPELL_ID,
+            effects = { 0 },
+            name = "Resonant Mark",
+        })
+        target:sendEvent('EnchantMachine_SetSoulMark', {
+            marker = actor,
+            markSpellId = CAPTURE_MARK_SPELL_ID,
+        })
+    end)
+    if not ok then
+        dbg.error("SummonMark", "Mark failed", tostring(err))
+        return false, "The machine could not mark that creature"
+    end
+
+    dbg.info("SummonMark", "Marked " .. creatureName .. " for " .. (actor.recordId or "player"))
+    return true, "Marked " .. creatureName .. ". Defeat it to bind its summon."
+end
+
+local function learnSummonFromCreature(creature, actor)
+    if not isValidObject(creature) or not types.Creature.objectIsInstance(creature) then
+        return false, "Marked target is no longer available"
+    end
+    actor = isValidObject(actor) and actor or world.players[1]
+    if not isValidObject(actor) or not types.Player.objectIsInstance(actor) then
+        return false, "No player is available to receive the summon"
+    end
+
+    local record = types.Creature.record(creature)
+    local creatureId = creature.recordId
+    if not record or not types.Creature.records[creatureId] then
+        return false, "The machine could not identify that creature"
+    end
+
+    local creatureName = (record.name and record.name ~= "" and record.name) or creatureId
+    local spellId, info = getSpellForCreature(creatureId)
+    if not spellId then
+        local ok, createdSpellId, spellName = pcall(function()
+            local newSpellId, newSpellName = createSummonSpell(creatureId, creatureName)
+            return newSpellId, newSpellName
+        end)
+        if not ok then
+            dbg.error("SummonLearn", "Spell creation failed", tostring(createdSpellId))
+            return false, "The machine could not create that summon spell"
+        end
+        spellId = createdSpellId
+        info = {
+            creatureId = creatureId,
+            creatureName = creatureName,
+            spellName = spellName,
+            duration = SUMMON_DURATION,
+        }
+        summonSpells[spellId] = info
+    end
+
+    local ok, err = pcall(function()
+        local spells = types.Actor.spells(actor)
+        if not spells[spellId] then
+            spells:add(spellId)
+        end
+    end)
+    if not ok then
+        dbg.error("SummonLearn", "Adding spell failed", tostring(err))
+        return false, "The machine created the spell, but could not teach it"
+    end
+
+    dbg.info("SummonLearn", "Learned " .. info.spellName .. " from " .. creatureId)
+    return true, "Bound " .. creatureName .. ". You learned " .. info.spellName .. "."
+end
+
+local function spawnSummon(actor, info)
+    if not isValidObject(actor) then
+        return false, "No summoner is available"
+    end
+    if not info or not info.creatureId or not types.Creature.records[info.creatureId] then
+        return false, "That summon no longer has a valid creature record"
+    end
+
+    local ok, result = pcall(function()
+        local summon = world.createObject(info.creatureId, 1)
+        local spawnPos = actor.position + util.vector3(128, 0, 0)
+        summon:teleport(actor.cell, spawnPos)
+        summon:addScript(SUMMON_SCRIPT, {
+            owner = actor,
+            duration = info.duration or SUMMON_DURATION,
+            creatureName = info.creatureName,
+        })
+        return summon
+    end)
+    if not ok then
+        dbg.error("SummonCast", "Summon spawn failed", tostring(result))
+        return false, "The summon failed to manifest"
+    end
+
+    return true, "Summoned " .. (info.creatureName or "creature") .. " for " .. SUMMON_DURATION .. " seconds."
+end
+
+local function checkSummonCasts()
+    for _, player in ipairs(world.players) do
+        if isValidObject(player) then
+            local activeSpells = types.Actor.activeSpells(player)
+            for _, activeSpell in pairs(activeSpells) do
+                local info = summonSpells[activeSpell.id]
+                if info then
+                    local success, message = spawnSummon(player, info)
+                    pcall(function() activeSpells:remove(activeSpell.activeSpellId) end)
+                    player:sendEvent('EnchantMachine_Message', {
+                        success = success,
+                        message = message,
+                    })
+                    break
+                end
+            end
+        end
+    end
+end
+
+local function onUpdate(dt)
+    summonPollTimer = summonPollTimer + dt
+    if summonPollTimer < SUMMON_POLL_INTERVAL then return end
+    summonPollTimer = 0
+    checkSummonCasts()
 end
 
 -- ItemUsage handlers don't persist across save/load — must be re-registered from
@@ -606,11 +831,12 @@ end
 local function onSave()
     dbg.info("Save", "Saving soul power: " .. soulPower)
     return {
-        version = 3,
+        version = 4,
         soulPower = soulPower,
         upgradedItems = upgradedItems,
         itemBaseRecords = itemBaseRecords,
         attuned = attuned,
+        summonSpells = summonSpells,
     }
 end
 
@@ -621,12 +847,15 @@ local function onLoad(data)
         itemBaseRecords = data.itemBaseRecords or {}
         -- attuned added in v3; older saves default to false.
         attuned = data.attuned or false
+        -- summonSpells added in v4.
+        summonSpells = data.summonSpells or {}
         dbg.info("Load", "Loaded soul power " .. soulPower)
     else
         soulPower = 0
         upgradedItems = {}
         itemBaseRecords = {}
         attuned = false
+        summonSpells = {}
         dbg.info("Load", "New game, starting at 0 soul power")
     end
 
@@ -686,6 +915,39 @@ local function onAddEnchantEvent(eventData)
     handleOperationEvent('add-enchant', addEnchantment, eventData)
 end
 
+local function onMarkCreatureEvent(eventData)
+    local actor = eventData and eventData.actor
+    local target = eventData and eventData.target
+    if not actor then return end
+
+    local success, message = markCreature(target, actor, eventData.settings)
+    actor:sendEvent('EnchantMachine_Result', {
+        success = success,
+        message = message,
+        operation = 'mark-creature',
+    })
+end
+
+local function onMarkedCreatureDiedEvent(eventData)
+    local creature = eventData and eventData.creature
+    local marker = eventData and eventData.marker
+    local actor = isValidObject(marker) and marker or world.players[1]
+    local success, message = learnSummonFromCreature(creature, actor)
+    if isValidObject(actor) then
+        actor:sendEvent('EnchantMachine_Message', {
+            success = success,
+            message = message,
+        })
+    end
+end
+
+local function onRemoveSummonEvent(eventData)
+    local summon = eventData and eventData.summon
+    if isValidObject(summon) then
+        pcall(function() summon:remove() end)
+    end
+end
+
 -- Attune the resonator. Unlike the other operations this acts on a location, not
 -- an inventory item, so it bypasses handleOperationEvent (which requires `item`).
 -- Succeeds only inside the Heart chamber; sets the persistent `attuned` flag.
@@ -740,6 +1002,11 @@ return {
         -- Attunement
         getAttuned = function() return attuned end,
 
+        -- Custom summons
+        markCreature = markCreature,
+        learnSummonFromCreature = learnSummonFromCreature,
+        getSummonSpells = function() return summonSpells end,
+
         -- Upgrade operations
         getUpgradedCapacity = getUpgradedCapacity,
         upgradeItemCapacity = upgradeItemCapacity,
@@ -749,6 +1016,7 @@ return {
     },
     engineHandlers = {
         onInit = onInit,
+        onUpdate = onUpdate,
         onSave = onSave,
         onLoad = onLoad,
     },
@@ -758,6 +1026,9 @@ return {
         EnchantMachine_UpgradeItem = onUpgradeItemEvent,
         EnchantMachine_RemoveEnchant = onRemoveEnchantEvent,
         EnchantMachine_AddEnchant = onAddEnchantEvent,
+        EnchantMachine_MarkCreature = onMarkCreatureEvent,
+        EnchantMachine_MarkedCreatureDied = onMarkedCreatureDiedEvent,
+        EnchantMachine_RemoveSummon = onRemoveSummonEvent,
         EnchantMachine_Attune = onAttuneEvent,
 
         -- PLAYER pushes its current settings here so machine.getSettings() (the

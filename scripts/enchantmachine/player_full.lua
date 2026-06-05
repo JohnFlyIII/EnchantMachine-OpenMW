@@ -8,6 +8,7 @@ local types = require('openmw.types')
 local util = require('openmw.util')
 local async = require('openmw.async')
 local storage = require('openmw.storage')
+local nearby = require('openmw.nearby')
 local I = require('openmw.interfaces')
 
 print("[EnchantMachine] Player script loading...")
@@ -114,6 +115,9 @@ local SCROLL_ITEM_ENCODED = "em_dwemer_scroll_encoded"
 local SCROLL_ITEM_DECODED = "em_dwemer_scroll_decoded"
 local scrollJournalDone = false
 
+local SUMMON_CAPTURE_RANGE = 2048
+local SUMMON_CAPTURE_LIMIT = 12
+
 -- ---------- Forward declarations ----------
 -- All menu functions reference each other (Back buttons, retry-after-result, etc.),
 -- so we declare every binding up front. Lua resolves closure upvalues at parse time;
@@ -128,6 +132,7 @@ local showUpgradeAmountMenu
 local showRemoveEnchantMenu
 local showAddEnchantMenu
 local showSpellSelectMenu
+local showCaptureSummonMenu
 local attuneResonator
 
 -- ---------- Settings sync (PLAYER -> GLOBAL) ----------
@@ -431,6 +436,43 @@ local function getKnownSpells()
     return spells
 end
 
+local function distanceToPlayer(actor)
+    local ok, distance = pcall(function()
+        return (actor.position - self.object.position):length()
+    end)
+    if ok and distance then return distance end
+
+    local delta = actor.position - self.object.position
+    return math.sqrt((delta.x or 0) * (delta.x or 0)
+        + (delta.y or 0) * (delta.y or 0)
+        + (delta.z or 0) * (delta.z or 0))
+end
+
+local function getNearbySummonCandidates()
+    local creatures = {}
+    for _, actor in ipairs(nearby.actors) do
+        if actor ~= self.object
+            and types.Creature.objectIsInstance(actor)
+            and not types.Actor.isDead(actor)
+        then
+            local distance = distanceToPlayer(actor)
+            if distance <= SUMMON_CAPTURE_RANGE then
+                table.insert(creatures, {
+                    actor = actor,
+                    record = types.Creature.record(actor),
+                    distance = distance,
+                })
+            end
+        end
+    end
+
+    table.sort(creatures, function(a, b) return a.distance < b.distance end)
+    while #creatures > SUMMON_CAPTURE_LIMIT do
+        table.remove(creatures)
+    end
+    return creatures
+end
+
 -- ---------- Menu definitions ----------
 
 showDepositMenu = function()
@@ -705,6 +747,42 @@ showSpellSelectMenu = function(entry)
     }
 end
 
+showCaptureSummonMenu = function()
+    closeMenu()
+
+    local candidates = getNearbySummonCandidates()
+    if #candidates == 0 then
+        ui.showMessage("No living creatures are close enough to mark.")
+        async:newUnsavableSimulationTimer(1.5, function() createMainMenu() end)
+        return
+    end
+
+    local items = {}
+    for _, entry in ipairs(candidates) do
+        local record = entry.record
+        local creatureName = (record and record.name and record.name ~= "" and record.name) or entry.actor.recordId
+        table.insert(items, createButton(
+            string.format("%s (%d units)", creatureName, math.floor(entry.distance)),
+            function()
+                core.sendGlobalEvent('EnchantMachine_MarkCreature', {
+                    actor = self.object,
+                    target = entry.actor,
+                    settings = getSettings(),
+                })
+                ui.showMessage("Marking creature...")
+                closeMenu()
+            end
+        ))
+    end
+
+    createMenu{
+        header = { type = 'boxed', text = "Mark Summon Creature" },
+        info = "Choose a nearby creature. Defeat it while marked to learn a 60-second summon.",
+        items = items,
+        onBack = function() createMainMenu() end,
+    }
+end
+
 attuneResonator = function()
     closeMenu()
     core.sendGlobalEvent('EnchantMachine_Attune', { actor = self.object })
@@ -722,6 +800,7 @@ createMainMenu = function()
     table.insert(items, createButton("Recharge Enchanted Items", showRechargeMenu))
     table.insert(items, createButton("Add Enchantment", showAddEnchantMenu))
     table.insert(items, createButton("Remove Enchantment", showRemoveEnchantMenu))
+    table.insert(items, createButton("Mark Summon Creature", showCaptureSummonMenu))
     if settings.enableUpgradeFeature then
         table.insert(items, createButton("Upgrade Item Capacity", showUpgradeMenu))
     else
@@ -770,8 +849,10 @@ local function checkScrollLooted()
 
     local inv = types.Actor.inventory(self.object)
     if inv:countOf(SCROLL_ITEM_ENCODED) > 0 or inv:countOf(SCROLL_ITEM_DECODED) > 0 then
-        quest:addJournalEntry(SCROLL_LOOTED_STAGE)
-        scrollJournalDone = true
+        if quest then
+            quest:addJournalEntry(SCROLL_LOOTED_STAGE)
+            scrollJournalDone = true
+        end
     end
 end
 
@@ -842,9 +923,18 @@ return {
                 reopen = showRemoveEnchantMenu
             elseif eventData.operation == 'add-enchant' then
                 reopen = showAddEnchantMenu
+            elseif eventData.operation == 'mark-creature' then
+                reopen = showCaptureSummonMenu
             end
             -- 'attune' (and any unknown op) falls through to the main menu.
             async:newUnsavableSimulationTimer(1.5, function() reopen() end)
+        end,
+        EnchantMachine_Message = function(eventData)
+            if eventData and eventData.success == false then
+                ui.showMessage("Error: " .. (eventData.message or "Unknown error"))
+            elseif eventData and eventData.message then
+                ui.showMessage(eventData.message)
+            end
         end,
         EnchantMachine_OpenMenu = function()
             ui.showMessage("The ancient Dwemer machine hums to life, its crystalline interface beginning to shimmer with ethereal light...")

@@ -1,6 +1,6 @@
 # Dwemer Enchanting Machine
 
-A powerful OpenMW mod that enables vastly more powerful enchanted items through a mysterious Dwemer artifact.
+A powerful OpenMW 0.51 RC mod that enables direct Lua enchanting, soul-power banking, item upgrades, and custom creature summons through a mysterious Dwemer artifact.
 
 ## What This Mod Does
 
@@ -8,7 +8,8 @@ Defeat a unique boss to obtain an ancient **Dwemer puzzle box** that lets you:
 1. **Bank soul power** from filled soul gems
 2. **Recharge enchanted items** anywhere, anytime
 3. **Upgrade unenchanted items** to have massively increased enchantment capacity
-4. Then use **normal Morrowind enchanters** to create incredibly powerful enchantments!
+4. **Add enchantments directly** from your known spells
+5. **Mark creatures** and learn a custom `Summon {creature}` spell when the marked creature dies
 
 The result: Create enchanted items with 10x, 50x, or even 100x the normal capacity - limited only by your soul power reserves.
 
@@ -21,13 +22,14 @@ The result: Create enchanted items with 10x, 50x, or even 100x the normal capaci
 - **Item Recharge**: Restore charges to enchanted items using stored soul power (1:1 ratio)
 - **Enhanced Enchanting**: Permanently increase item enchantment capacity before enchanting
   - Upgrade unenchanted items to have much higher capacity (configurable, default 100:1 soul power cost)
-  - Then enchant them normally at any enchanter for vastly more powerful enchantments
+  - Then enchant them directly through the machine or normally at any enchanter
   - Stack multiple upgrades on the same item for extreme capacity
-  - Works with vanilla enchanting mechanics - no API limitations!
+  - Works with both direct Lua enchanting and vanilla enchanters
 - **Remove Enchantment**: Strip the enchantment from any enchanted weapon, armor, or clothing
   - Refunds soul power based on the enchantment's charge
   - Frees pre-enchanted artifacts to be re-enchanted via the normal enchanting system (or upgraded here first)
-- **Add Enchantment**: Opens the game's native enchanting menu — pick from your known spells with standard cost rules *(requires a filled soul gem; pending verification on some engine builds)*
+- **Add Enchantment**: Creates a runtime enchantment record from one of your known spells and swaps it onto the selected item
+- **Custom Summons**: Mark a nearby creature, defeat it while marked, and learn a generated `Summon {creature}` spell with a 60-second duration
 - **Attune Resonator**: Attunes the device to the Heart of Lorkhan — only succeeds within the final Dagoth Ur chamber (`Akulakhan's Chamber`); sets a persistent attunement flag
 
 ### Technical Features ✅
@@ -43,18 +45,16 @@ The result: Create enchanted items with 10x, 50x, or even 100x the normal capaci
 
 ## Requirements
 
-- OpenMW 0.49 or later
-- Lua scripting enabled (default in OpenMW 0.49+)
+- OpenMW 0.51 RC
+- Lua scripting enabled
 
 ## Installation
 
 1. Copy the `enchant-machine` folder to your OpenMW data directory
-2. Add this line to your `openmw.cfg`:
+2. Add these lines to your `openmw.cfg`:
    ```
    data="path/to/enchant-machine"
-   ```
-3. In OpenMW Launcher, enable the mod by adding:
-   ```
+   content=EnchantMachine.omwaddon
    lua-scripts=EnchantMachine.omwscripts
    ```
 
@@ -103,23 +103,24 @@ This adds the remote directly to your inventory (handler in `global.lua`).
 2. The ancient machine interface appears with options:
    - **Deposit Soul Gems**: Convert filled soul gems into stored soul power
    - **Recharge Item**: Restore charges to enchanted items (1 soul power per charge point)
-   - **Add Enchantment**: Open the game's native enchanting menu to enchant from your known spells
+   - **Add Enchantment**: Imbue an unenchanted weapon, armor, or clothing item with one of your known spells
    - **Remove Enchantment**: Strip an item's enchantment and refund soul power
+   - **Mark Summon Creature**: Mark a nearby creature; killing it teaches a 60-second summon spell
    - **Upgrade Item Capacity**: Permanently increase an unenchanted item's enchantment capacity
    - **Attune Resonator**: Attune to the Heart (only works in the final Dagoth Ur chamber)
-3. **After upgrading an item**, visit any enchanter in Morrowind to create incredibly powerful enchantments!
+3. **After upgrading an item**, use **Add Enchantment** or visit any enchanter in Morrowind to create incredibly powerful enchantments.
 
 **Important Notes**:
 - Press **ESC** to close any menu at any time
 - The Remote is **not consumed** when used - keep it forever!
 - Only **unenchanted** items can be upgraded (always upgrade before enchanting!)
-- After upgrading, use **normal Morrowind enchanters** to create your powerful enchantments
+- After upgrading, use **Add Enchantment** or normal Morrowind enchanters to create your powerful enchantments
 
 ### Workflow Example
 
 1. Find/buy an unenchanted item you want to make powerful
 2. Use the Remote → Upgrade Item Capacity → Select item → Upgrade (costs soul power)
-3. Visit any enchanter (Balmora, Vivec, etc.) and enchant the upgraded item normally
+3. Use Add Enchantment from the Remote, or visit any enchanter and enchant the upgraded item normally
 4. Enjoy your massively more powerful enchanted item!
 
 ### Settings
@@ -136,8 +137,11 @@ Access mod settings in OpenMW under: **Settings → Scripts → Dwemer Enchantin
 
 ### Architecture
 
-- **global.lua**: GLOBAL script — soul bank, item upgrades, settings sync, save/load, remote-item handler
+- **load.lua**: LOAD script — defines the custom mark/summon magic effects and hidden mark spell
+- **global.lua**: GLOBAL script — soul bank, item swaps, custom summon capture/spawn, settings sync, save/load, remote-item handler
 - **player_full.lua**: PLAYER script — UI menus, settings page, inventory scanning, boss-cell detection
+- **soul_mark_monitor.lua**: NPC/CREATURE local script — watches marked creatures for death
+- **summoned.lua**: CUSTOM local script — keeps spawned summons following the player and removes them after 60 seconds
 - **machine.lua**: CUSTOM script — attached to in-world activators (optional), forwards activation to the player
 - **spawn_researcher.lua**: GLOBAL script — one-time boss encounter spawn
 - **debug.lua**: GLOBAL script — logging, metrics, and performance tools
@@ -148,15 +152,16 @@ See `DEVELOPER_GUIDE.md` for the full architecture, event protocol, and storage 
 
 When you upgrade an item:
 1. Creates a **new item record** with increased `enchantCapacity` property
-2. Replaces the old item with the upgraded version in your inventory
+2. Replaces one old item instance with the upgraded version in your inventory
 3. Preserves item condition and any existing charges
-4. Tracks the upgrade in save file (multiple upgrades stack)
+4. Tracks the generated record's base record in the save file (multiple upgrades on that item stack)
 5. You can then enchant it normally at any enchanter for powerful results
 
 ### Data Storage
 
 - **Soul Power**: Stored per save file, shared globally
-- **Upgraded Items**: Tracked by record ID with base record mapping
+- **Upgraded Items**: Tracked per generated record ID with base record mapping
+- **Custom Summons**: Generated summon spell IDs map to captured creature record IDs
 - **Settings**: Persistent per-character configuration
 
 ### API Interface
@@ -164,7 +169,8 @@ When you upgrade an item:
 Other mods can interact with the EnchantMachine through its global interface:
 
 ```lua
-local machine = core.getGlobalScript('EnchantMachine')
+local I = require('openmw.interfaces')
+local machine = I.EnchantMachine
 
 -- Soul Power Management
 local power = machine.getSoulPower()                        -- Get current soul power
@@ -181,6 +187,10 @@ local capacity = machine.getItemCapacity(item)              -- Get total capacit
 local upgrade = machine.getUpgradedCapacity(itemRecordId)   -- Get current upgrade level
 local success, msg = machine.upgradeItemCapacity(item, amount, actor)  -- Upgrade by amount
 
+-- Custom Summons
+local success, msg = machine.markCreature(creature, actor)  -- Mark a living creature
+local summons = machine.getSummonSpells()                   -- Generated summon spell metadata
+
 -- Settings
 local settings = machine.getSettings()                      -- Get all settings
 -- settings.enableMachine, settings.upgradeRatio, settings.enableUpgradeFeature
@@ -188,7 +198,7 @@ local settings = machine.getSettings()                      -- Get all settings
 
 ## Status
 
-**Version**: 2.1.0
+**Version**: 2.2.0
 **Status**: ✅ PRODUCTION READY - Fully Functional!
 
 All core features are implemented and working:
@@ -197,17 +207,18 @@ All core features are implemented and working:
 - ✅ **Soul Power Banking** - Deposit and manage soul power globally
 - ✅ **Item Recharge** - Restore charges to enchanted items
 - ✅ **Capacity Upgrades** - Permanently increase item enchantment capacity
+- ✅ **Direct Lua Enchanting** - Add enchantments from known spells without native UI handoff
+- ✅ **Custom Summons** - Capture marked creatures into generated 60-second summon spells
 - ✅ **Multiple Upgrades** - Stack upgrades on the same item repeatedly
 - ✅ **Save/Load Persistence** - All data tied to save files properly
 - ✅ **Clean UI** - Morrowind-styled menus with ESC key support
 - ✅ **Configurable** - Adjust costs and multipliers via mod settings
 
-**Latest Update (v2.1.0 - 2025-01-12):**
-- ✨ Fixed remote control item - now properly opens menu from inventory
-- ✨ Remote uses Dwemer puzzle box mesh and visuals
-- ✨ Enhanced enchanting achieved through capacity upgrades + vanilla enchanters
-- ✨ Improved atmospheric messages and UI feedback
-- ✨ Cleaned up codebase and removed development artifacts
+**Latest Update (v2.2.0 - 2026-06-05):**
+- Direct Lua Add Enchantment flow using runtime enchantment and item records
+- Custom creature summon capture flow using 0.51 RC load-time custom magic effects
+- Safer item record swaps for upgrades, add-enchant, and remove-enchant
+- Upgrade tracking fixed to avoid leaking capacity upgrades across all items with the same base record
 
 ### For Developers
 
@@ -215,25 +226,25 @@ See **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)** for API documentation and exten
 
 ## How It Works
 
-The mod achieves "enhanced enchanting" by **increasing item capacity before you enchant them**:
+The mod achieves enhanced enchanting by creating runtime records in GLOBAL scripts:
 
-1. The machine upgrades an unenchanted item's enchantment capacity
-2. You then use **normal Morrowind enchanting** (at any enchanter NPC)
-3. The vanilla game lets you create much more powerful enchantments due to the increased capacity
-4. Result: Massively more powerful enchanted items without needing runtime enchantment creation!
+1. The machine can derive an item record with higher `enchantCapacity`
+2. Add Enchantment creates an enchantment record from a known spell, then derives an item record pointing at it
+3. Remove Enchantment derives a blank item record and refunds soul power from the old enchantment
+4. Custom summons create spell records tied to captured creature record IDs
 
-This approach works perfectly with vanilla mechanics and has no API limitations. See [ENCHANTING_LIMITATION.md](ENCHANTING_LIMITATION.md) for technical details.
+See [ENCHANTING_LIMITATION.md](ENCHANTING_LIMITATION.md) for technical details.
 
 ## Compatibility
 
-- **OpenMW**: 0.49+ required
+- **OpenMW**: 0.51 RC required
 - **Save Files**: Safe to add/remove (uses persistent storage)
 - **Other Mods**: Should be compatible with most mods
 - **MWSE**: Not compatible (this is OpenMW-only)
 
 ## Credits
 
-- Built for OpenMW 0.49 Lua scripting API
+- Built for OpenMW 0.51 RC Lua scripting API
 - Inspired by Morrowind's enchanting mechanics
 
 ## License

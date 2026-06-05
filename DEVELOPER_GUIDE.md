@@ -16,8 +16,11 @@ enchant-machine/
 ├── l10n/EnchantMachine/
 │   └── en.lua                        # Localization strings
 └── scripts/enchantmachine/
-    ├── global.lua                    # GLOBAL: soul-power, items, upgrades, settings store
+    ├── load.lua                      # LOAD: custom magic effects and hidden mark spell
+    ├── global.lua                    # GLOBAL: soul-power, items, upgrades, summons, settings store
     ├── player_full.lua               # PLAYER: UI, settings page, input
+    ├── soul_mark_monitor.lua         # NPC/CREATURE: marked-creature death monitor
+    ├── summoned.lua                  # CUSTOM: timed custom summon behavior
     ├── machine.lua                   # CUSTOM: activator-attached, forwards to player
     ├── debug.lua                     # GLOBAL: logging, metrics, performance
     └── spawn_researcher.lua          # GLOBAL: one-time boss encounter
@@ -29,10 +32,13 @@ OpenMW splits Lua execution into contexts. Each script in `EnchantMachine.omwscr
 
 | Script               | Context | Loads via            |
 |----------------------|---------|----------------------|
+| `load.lua`           | LOAD    | `LOAD:` directive    |
 | `global.lua`         | GLOBAL  | `GLOBAL:` directive  |
 | `debug.lua`          | GLOBAL  | `GLOBAL:` directive  |
 | `spawn_researcher.lua` | GLOBAL | `GLOBAL:` directive |
 | `player_full.lua`    | PLAYER  | `PLAYER:` directive  |
+| `soul_mark_monitor.lua` | NPC/CREATURE | `NPC, CREATURE:` directive |
+| `summoned.lua`       | CUSTOM  | `CUSTOM:` directive, attached to spawned summons |
 | `machine.lua`        | CUSTOM  | `CUSTOM:` directive, attached to activator objects |
 
 **Key constraint:** GLOBAL has world authority (`world.createRecord`, `world.createObject`, creature records). PLAYER has UI and input. Crossing contexts requires events — there's no shared mutable state. See `ENCHANTING_LIMITATION.md` for the deeper explanation of why upgrades must create derived records.
@@ -41,8 +47,9 @@ OpenMW splits Lua execution into contexts. Each script in `EnchantMachine.omwscr
 
 #### global.lua — Core logic
 - Soul-power bank (in-memory, persisted via `onSave`/`onLoad`).
-- Soul-gem deposit, item recharge, capacity upgrade.
-- Custom-record creation for upgraded items (`<base>_cap<N>` IDs).
+- Soul-gem deposit, item recharge, capacity upgrade, direct enchantment add/remove.
+- Runtime record creation for upgraded/enhanced items, enchantments, and generated summon spells.
+- Custom summon capture: mark a creature, learn a `Summon {creature}` spell on death, spawn a timed follower on cast.
 - Remote-control item handler registered via `I.ItemUsage.addHandlerForType`.
 - Exports the public `EnchantMachine` interface (see API Reference).
 - Receives `EnchantMachine_SyncSettings` events from PLAYER to keep its `getSettings()` consistent with the user-configured values.
@@ -51,8 +58,14 @@ OpenMW splits Lua execution into contexts. Each script in `EnchantMachine.omwscr
 - Registers the Settings page (`Options → Scripts → Dwemer Enchanting Machine`).
 - Reads soul power from `storage.globalSection('EnchantMachine_SharedData')` (write-cached by GLOBAL).
 - Builds menus via the local `createMenu{}` helper.
-- Sends operation events (`EnchantMachine_DepositGem`, `EnchantMachine_RechargeItem`, `EnchantMachine_UpgradeItem`) and waits for `EnchantMachine_Result` replies.
+- Sends operation events (`EnchantMachine_DepositGem`, `EnchantMachine_RechargeItem`, `EnchantMachine_UpgradeItem`, `EnchantMachine_AddEnchant`, `EnchantMachine_MarkCreature`) and waits for replies.
 - Detects entry into the boss cell and pings GLOBAL to spawn the encounter.
+
+#### soul_mark_monitor.lua — Marked creature watcher
+Automatically attached to all NPCs and creatures, but exits unless `self` is a creature. GLOBAL applies the active mark spell and sends `EnchantMachine_SetSoulMark`; this script polls for death and sends `EnchantMachine_MarkedCreatureDied` once.
+
+#### summoned.lua — Timed summon behavior
+Dynamically attached by GLOBAL to a spawned custom summon. It pacifies the creature best-effort, starts a Follow AI package toward the player, refreshes that package, and asks GLOBAL to remove the summon after 60 seconds or on death.
 
 #### machine.lua — Activator handler
 Twenty-line script attached to in-world activator objects. Forwards activation to the player via `actor:sendEvent('EnchantMachine_OpenMenu', …)`.
@@ -73,7 +86,7 @@ One-time spawn of the Master Dwemer Researcher + guards at a configured Dwemer-r
 | `SettingsEnchantMachineConfig`   | PLAYER  | The real settings UI store (per-player). |
 | `SettingsEnchantMachineStatus`   | PLAYER  | Read-only soul-power line on settings page. |
 
-In-memory state (`soulPower`, `upgradedItems`, `itemBaseRecords`, `bossSpawned`, `bossSpawnRequested`) is persisted via each script's `onSave` / `onLoad`.
+In-memory state (`soulPower`, `upgradedItems`, `itemBaseRecords`, `attuned`, `summonSpells`, `bossSpawned`, `bossSpawnRequested`) is persisted via each script's `onSave` / `onLoad`.
 
 ## Cross-Context Events
 
@@ -83,7 +96,14 @@ In-memory state (`soulPower`, `upgradedItems`, `itemBaseRecords`, `bossSpawned`,
 | `EnchantMachine_DepositGem`      | PLAYER → GLOBAL  | Consume a soul gem, credit soul power.   |
 | `EnchantMachine_RechargeItem`    | PLAYER → GLOBAL  | Recharge an enchanted item.              |
 | `EnchantMachine_UpgradeItem`     | PLAYER → GLOBAL  | Upgrade an item's `enchantCapacity`.     |
+| `EnchantMachine_RemoveEnchant`   | PLAYER → GLOBAL  | Clear an item's enchantment and refund soul power. |
+| `EnchantMachine_AddEnchant`      | PLAYER → GLOBAL  | Create an enchantment from a known spell and swap it onto an item. |
+| `EnchantMachine_MarkCreature`    | PLAYER → GLOBAL  | Apply the custom capture mark to a nearby creature. |
+| `EnchantMachine_SetSoulMark`     | GLOBAL → CREATURE | Arm the local death monitor after GLOBAL applies the active mark spell. |
+| `EnchantMachine_MarkedCreatureDied` | CREATURE → GLOBAL | Learn or re-teach the generated summon spell. |
+| `EnchantMachine_RemoveSummon`    | CUSTOM → GLOBAL   | Remove an expired spawned summon. |
 | `EnchantMachine_Result`          | GLOBAL → PLAYER  | Operation reply (`success`, `message`).  |
+| `EnchantMachine_Message`         | GLOBAL → PLAYER  | Fire-and-forget message that should not reopen machine UI. |
 | `EnchantMachine_SyncSettings`    | PLAYER → GLOBAL  | Push current settings to GLOBAL.         |
 | `EnchantMachine_SpawnBoss`       | PLAYER → GLOBAL  | Request boss spawn (fired on cell entry).|
 | `EnchantMachine_GiveRemote`      | console → GLOBAL | Debug: add a remote to the player.       |
@@ -91,7 +111,8 @@ In-memory state (`soulPower`, `upgradedItems`, `itemBaseRecords`, `bossSpawned`,
 ## API Reference
 
 ```lua
-local machine = core.getGlobalScript('EnchantMachine')
+local I = require('openmw.interfaces')
+local machine = I.EnchantMachine
 
 -- Soul Power Management
 machine.getSoulPower() -> number
@@ -110,6 +131,11 @@ machine.getEffectiveEnchantCapacity(item) -> number
 -- Upgrade Operations
 machine.getUpgradedCapacity(itemRecordId) -> number
 machine.upgradeItemCapacity(item, capacityIncrease, actor, settings?) -> (success, message)
+
+-- Custom Summons
+machine.markCreature(creature, actor, settings?) -> (success, message)
+machine.learnSummonFromCreature(creature, actor) -> (success, message)
+machine.getSummonSpells() -> table
 
 -- Settings
 machine.getSettings() -> {
@@ -152,11 +178,11 @@ debug.setDebugEnabled(bool)
 The upgrade pipeline lives in `global.lua:upgradeItemCapacity`:
 
 1. Resolve the **base** record ID: check `itemBaseRecords[item.recordId]`, then fall back to pattern-matching `^(.-)_cap%d+$`, then the item's own recordId.
-2. Read the cumulative upgrade delta from `upgradedItems[baseRecordId]`.
-3. Compute `newCapacity = baseCapacity + previousUpgrade + capacityIncrease`.
-4. Create a derived record with id `<base>_cap<newCapacity>` and the new `enchantCapacity`. Store `itemBaseRecords[newId] = baseRecordId`.
-5. Instantiate the new item, copy `condition` and `enchantmentCharge` from the old instance, move into the actor, then remove the old item.
-6. Update `upgradedItems[baseRecordId]`.
+2. Read the actual current `record.enchantCapacity`; this prevents upgrades from leaking across every item with the same base record.
+3. Compute `newCapacity = currentCapacity + capacityIncrease`.
+4. Create a derived record with the new `enchantCapacity`, instantiate it, copy `condition` and `enchantmentCharge`, move it into the actor, then remove one old item.
+5. Store `itemBaseRecords[newId] = baseRecordId` and `upgradedItems[newId] = newCapacity - baseCapacity`.
+6. Charge soul power only after the record/object swap succeeds.
 
 `getItemCapacity` simply returns `record.enchantCapacity` — the upgrade is already baked in.
 
@@ -165,10 +191,15 @@ The upgrade pipeline lives in `global.lua:upgradeItemCapacity`:
 `global.lua`:
 ```lua
 {
-    version = 2,
+    version = 4,
     soulPower = number,
-    upgradedItems = { [baseRecordId] = totalUpgrade, ... },
+    upgradedItems = { [generatedRecordId] = totalUpgrade, ... },
     itemBaseRecords = { [generatedRecordId] = baseRecordId, ... },
+    attuned = boolean,
+    summonSpells = {
+        [spellRecordId] = { creatureId = string, creatureName = string, spellName = string, duration = number },
+        ...
+    },
 }
 ```
 
@@ -192,6 +223,7 @@ When changing the schema, bump `version` and handle migration in `onLoad`.
 4. Add a `show*Menu` function in `player_full.lua`. **Add a forward declaration at the top of the file** alongside the existing ones — Lua resolves closure upvalues at parse time, so any reference to a not-yet-declared local silently becomes a global.
 5. Wire the new menu into `createMainMenu`.
 6. Pass the current settings on the outgoing event (`settings = getSettings()`).
+7. If the feature needs custom records available before runtime, add them in `load.lua`; LOAD scripts do not rerun on `reloadlua`.
 
 ## Debugging Tips
 
@@ -210,5 +242,5 @@ When changing the schema, bump `version` and handle migration in `onLoad`.
 
 ## Resources
 
-- **OpenMW Lua Docs**: https://openmw.readthedocs.io/en/stable/reference/lua-scripting/
+- **OpenMW Lua Docs**: https://openmw.readthedocs.io/en/latest/reference/lua-scripting/
 - **OpenMW Forums**: https://forum.openmw.org/

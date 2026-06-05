@@ -1,11 +1,11 @@
 # Enhanced Enchanting Feature - API Status
 
-## Status: Now Supported (API verified, runtime test pending)
+## Status: Implemented for OpenMW 0.51 RC
 
 > **History:** This document previously stated that custom enchanting was *impossible*
 > due to OpenMW Lua API limitations (written against OpenMW 0.49, 2025-01-08). **That is
-> no longer true.** As of OpenMW Lua **API revision 131** the required APIs exist, and
-> this document was rewritten on 2026-06-01 to reflect that.
+> no longer true.** OpenMW 0.51 RC exposes the required runtime record APIs, and
+> this document now describes the implementation used by this mod.
 
 ## What is now possible
 
@@ -27,7 +27,7 @@ OpenMW Lua now provides everything needed to create and assign enchantments at r
    `MagicEffectWithParams`: `id`, `magnitudeMin`, `magnitudeMax`, `duration`, `range`,
    `area`, and optional `affectedSkill` / `affectedAttribute`.
 
-### API references (OpenMW source, rev 131)
+### API references
 
 | API | Location |
 |-----|----------|
@@ -72,26 +72,16 @@ newItem:moveInto(types.Actor.inventory(actor))
 item:remove(1)
 ```
 
-No OpenMW-CS / `.omwaddon` work is required — this is pure Lua.
+No OpenMW-CS work is required for item enchantment records — this is runtime Lua.
 
-## Remaining unknown (needs one in-game test)
+## Current implementation
 
-The API *surface* is confirmed; runtime *behavior* has **not** yet been verified in-game.
-Before building a custom-effect UI, run one throwaway test to answer:
+The mod implements direct Add Enchantment in `scripts/enchantmachine/global.lua`:
 
-1. Does the engine enforce **"enchantment cost ≤ item `enchantCapacity`"** for
-   runtime-assigned enchantments, or accept any cost? (This determines how the existing
-   `enchantMultiplier` / soul-power economy plugs in.)
-2. Does an assigned custom enchantment actually **function** — charge drains correctly,
-   cast-on-strike/use fires, constant effect applies, and it shows in the item tooltip?
-
-## Suggested rollout
-
-| Feature | Risk | Notes |
-|---------|------|-------|
-| Remove Enchantment | Low | Near-copy of the upgrade handler |
-| Add — *existing* enchantment | Low | Derive with `enchant = <id>` + a simple list menu |
-| Add — *custom* enchantment | Medium | UI-heavy (flat button menus, no MWUI scroll container); do the runtime test first |
+1. PLAYER lists known castable spells and sends `EnchantMachine_AddEnchant`.
+2. GLOBAL copies the selected spell's effects into a new enchantment record.
+3. GLOBAL derives a weapon/armor/clothing record with `enchant = generatedEnchantId`.
+4. GLOBAL swaps one inventory item instance to the generated record and charges soul power only after the swap succeeds.
 
 ## Implemented today
 
@@ -106,14 +96,12 @@ Before building a custom-effect UI, run one throwaway test to answer:
    the player stands in the Heart of Lorkhan chamber (`Akulakhan's Chamber`); otherwise
    responds "The device failed to attune." See `onAttuneEvent` / `getAttuned` in `global.lua`.
 
-⏳ **Add Enchantment** — wired to open the engine's native enchanting window
-   (`I.UI.addMode('Enchanting')`) so the player picks from known spells with vanilla cost
-   rules. **Pending in-game verification** that the mode opens a usable self-enchant window
-   (and the soul-gem requirement, since this mod banks souls as abstract power). Remove
-   already unblocks the vanilla enchanting path regardless.
+✅ **Add Enchantment** — creates a runtime enchantment from a known player spell and swaps
+   a generated item record into the actor inventory. Weapons cast on strike; armor and
+   clothing cast on use.
 
 ---
 
-**Last Updated:** 2026-06-01
-**OpenMW Lua API Revision Verified:** 131 (source clone 2026-05-27)
-**API Status:** Enchantment creation & assignment supported; Remove Enchantment + Attune implemented; native Add-Enchantment menu pending in-game test
+**Last Updated:** 2026-06-05
+**OpenMW Target:** 0.51 RC
+**API Status:** Enchantment creation & assignment implemented; custom summon effects are defined by a LOAD script
