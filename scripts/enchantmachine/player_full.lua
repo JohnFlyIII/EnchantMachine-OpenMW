@@ -126,7 +126,8 @@ local showRechargeMenu
 local showUpgradeMenu
 local showUpgradeAmountMenu
 local showRemoveEnchantMenu
-local openNativeEnchantMenu
+local showAddEnchantMenu
+local showSpellSelectMenu
 local attuneResonator
 
 -- ---------- Settings sync (PLAYER -> GLOBAL) ----------
@@ -401,6 +402,35 @@ local function getEnchantedItems()
     return items
 end
 
+-- Unenchanted weapons/armor/clothing that can hold an enchantment — candidates for
+-- Add Enchantment. Same filter as getUpgradeableItems but kept separate so the two
+-- features can diverge (Add doesn't depend on the upgrade feature being unlocked).
+local function getEnchantableItems()
+    local items = {}
+    for _, item in ipairs(types.Actor.inventory(self):getAll()) do
+        local record = getEnchantableRecord(item)
+        if record
+            and record.enchantCapacity and record.enchantCapacity > 0
+            and (not record.enchant or record.enchant == "")
+        then
+            table.insert(items, { item = item, record = record })
+        end
+    end
+    return items
+end
+
+-- The player's known, castable spells (excludes abilities, diseases, powers, etc.)
+-- — these are the templates offered as enchantments.
+local function getKnownSpells()
+    local spells = {}
+    for _, spell in pairs(types.Actor.spells(self)) do
+        if spell.type == core.magic.SPELL_TYPE.Spell then
+            table.insert(spells, spell)
+        end
+    end
+    return spells
+end
+
 -- ---------- Menu definitions ----------
 
 showDepositMenu = function()
@@ -598,16 +628,81 @@ showRemoveEnchantMenu = function()
     }
 end
 
--- "Add Enchantment" hands off to the game's own enchanting window so the player
--- selects from known spells with vanilla cost rules. Self-enchanting needs a
--- filled soul gem in the inventory; we surface that hint and let the engine drive.
-openNativeEnchantMenu = function()
+-- "Add Enchantment" enchants an unenchanted item with one of the player's known
+-- spells, entirely in Lua via the GLOBAL record-swap (see addEnchantment there).
+-- The old native-UI handoff (I.UI.addMode('Enchanting')) is gone: it failed because
+-- the engine's EnchantingDialog needs a Ptr the Lua API can't supply.
+showAddEnchantMenu = function()
     closeMenu()
-    local ok = pcall(function() I.UI.addMode('Enchanting') end)
-    if not ok then
-        ui.showMessage("This version of the engine could not open the enchanting menu. Use a filled soul gem at an enchanter instead.")
-        async:newUnsavableSimulationTimer(2.0, function() createMainMenu() end)
+
+    local candidates = getEnchantableItems()
+    if #candidates == 0 then
+        ui.showMessage("You have no unenchanted weapons, armor, or clothing that can hold an enchantment.")
+        async:newUnsavableSimulationTimer(1.5, function() createMainMenu() end)
+        return
     end
+
+    local items = {}
+    for _, entry in ipairs(candidates) do
+        local itemName = entry.record.name or "Item"
+        local capacity = math.floor(entry.record.enchantCapacity or 0)
+        table.insert(items, createButton(
+            string.format("%s (Capacity: %d)", itemName, capacity),
+            function() showSpellSelectMenu(entry) end
+        ))
+    end
+
+    createMenu{
+        header = { type = 'boxed', text = "Add Enchantment" },
+        info = "Choose an item, then a known spell to imbue into it.",
+        items = items,
+        onBack = function() createMainMenu() end,
+    }
+end
+
+showSpellSelectMenu = function(entry)
+    closeMenu()
+
+    local spells = getKnownSpells()
+    if #spells == 0 then
+        ui.showMessage("You know no castable spells to imbue.")
+        async:newUnsavableSimulationTimer(1.5, function() showAddEnchantMenu() end)
+        return
+    end
+
+    local soulPower = getSoulPower()
+    local settings = getSettings()
+    local multiplier = settings.enchantMultiplier or 10
+    -- Mirrors the GLOBAL charge calc: capacity * multiplier, filled to full 1:1.
+    local charge = math.floor((entry.record.enchantCapacity or 0) * multiplier)
+    local canAfford = soulPower >= charge
+
+    local items = {}
+    for _, spell in ipairs(spells) do
+        local spellName = spell.name or spell.id
+        table.insert(items, createButton(
+            string.format("%s (cost %d)", spellName, math.floor(spell.cost or 0)),
+            function()
+                core.sendGlobalEvent('EnchantMachine_AddEnchant', {
+                    actor = self.object,
+                    item = entry.item,
+                    spellId = spell.id,
+                    settings = getSettings(),
+                })
+                ui.showMessage("Imbuing enchantment...")
+                closeMenu()
+            end,
+            canAfford
+        ))
+    end
+
+    createMenu{
+        header = { type = 'boxed', text = "Imbue: " .. (entry.record.name or "Item") },
+        info = string.format("Soul Power: %d | Cost to enchant: %d power", math.floor(soulPower), charge),
+        warning = "Weapons cast on strike; armor & clothing cast on use. Item arrives fully charged.",
+        items = items,
+        onBack = function() showAddEnchantMenu() end,
+    }
 end
 
 attuneResonator = function()
@@ -625,7 +720,7 @@ createMainMenu = function()
     local items = {}
     table.insert(items, createButton("Deposit Soul Gems", showDepositMenu))
     table.insert(items, createButton("Recharge Enchanted Items", showRechargeMenu))
-    table.insert(items, createButton("Add Enchantment", openNativeEnchantMenu))
+    table.insert(items, createButton("Add Enchantment", showAddEnchantMenu))
     table.insert(items, createButton("Remove Enchantment", showRemoveEnchantMenu))
     if settings.enableUpgradeFeature then
         table.insert(items, createButton("Upgrade Item Capacity", showUpgradeMenu))
@@ -745,6 +840,8 @@ return {
                 reopen = showUpgradeMenu
             elseif eventData.operation == 'remove-enchant' then
                 reopen = showRemoveEnchantMenu
+            elseif eventData.operation == 'add-enchant' then
+                reopen = showAddEnchantMenu
             end
             -- 'attune' (and any unknown op) falls through to the main menu.
             async:newUnsavableSimulationTimer(1.5, function() reopen() end)

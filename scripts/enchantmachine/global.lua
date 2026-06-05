@@ -440,6 +440,138 @@ local function removeEnchantment(item, actor, settings)
         record.name or "item", refund)
 end
 
+-- Enchant an unenchanted item by deriving an Enchantment record from one of the
+-- player's known spells and swapping the inventory item to a record that points at
+-- it. This replaces the old native-UI handoff (I.UI.addMode('Enchanting')), which
+-- failed on this engine because EnchantingDialog needs an engine-side Ptr that the
+-- Lua API can't supply. Same record-swap pattern as upgrade/remove.
+--
+-- Weapons cast on strike; armor & clothing cast on use. The charge pool is the
+-- item's capacity scaled by enchantMultiplier (the mod's signature boost), and we
+-- fill it to full up front for `charge` soul power (1:1, consistent with recharge).
+local function addEnchantment(item, actor, settings, eventData)
+    dbg.startTimer("addEnchantment")
+
+    settings = settings or getSettings()
+    if not settings.enableMachine then
+        dbg.endTimer("addEnchantment")
+        return false, "The machine is disabled"
+    end
+
+    local spellId = eventData and eventData.spellId
+    if not spellId then
+        dbg.endTimer("addEnchantment")
+        return false, "No spell selected"
+    end
+
+    local record, oldData, typeMod = getEnchantable(item)
+    if not record then
+        dbg.endTimer("addEnchantment")
+        return false, "Only weapons, armor, and clothing can be enchanted"
+    end
+    if record.enchant and record.enchant ~= "" then
+        dbg.endTimer("addEnchantment")
+        return false, "Item is already enchanted"
+    end
+    if not record.enchantCapacity or record.enchantCapacity <= 0 then
+        dbg.endTimer("addEnchantment")
+        return false, "Item cannot hold enchantments"
+    end
+
+    local spell = core.magic.spells.records[spellId]
+    if not spell then
+        dbg.endTimer("addEnchantment")
+        return false, "Unknown spell"
+    end
+
+    -- Copy the spell's effects into plain tables. MagicEffectWithParams shares the
+    -- same field set between spells and enchantments, so this maps straight across.
+    local effects = {}
+    for _, e in ipairs(spell.effects) do
+        effects[#effects + 1] = {
+            id = e.id,
+            affectedSkill = e.affectedSkill,
+            affectedAttribute = e.affectedAttribute,
+            range = e.range,
+            area = e.area,
+            magnitudeMin = e.magnitudeMin,
+            magnitudeMax = e.magnitudeMax,
+            duration = e.duration,
+        }
+    end
+    if #effects == 0 then
+        dbg.endTimer("addEnchantment")
+        return false, "That spell has no usable effects"
+    end
+
+    local enchType = (typeMod == types.Weapon)
+        and core.magic.ENCHANTMENT_TYPE.CastOnStrike
+        or core.magic.ENCHANTMENT_TYPE.CastOnUse
+
+    local multiplier = settings.enchantMultiplier or 10
+    local charge = math.floor((record.enchantCapacity or 0) * multiplier)
+    if charge <= 0 then
+        dbg.endTimer("addEnchantment")
+        return false, "Item cannot hold enchantments"
+    end
+    local castCost = math.max(1, math.floor(spell.cost or 1))
+
+    -- Charge the bank for filling the enchantment to full (1 power per charge point).
+    local success, remaining = subtractSoulPower(charge)
+    if not success then
+        dbg.endTimer("addEnchantment")
+        return false, "Not enough soul power (need " .. charge .. ", have " .. remaining .. ")"
+    end
+
+    -- Build the enchantment record, then a derived item record pointing at it.
+    -- Guard creation: a bad effect set should refund and report, not hard-error.
+    local ok, enchOrErr = pcall(function()
+        local enchDraft = core.magic.enchantments.createRecordDraft({
+            type = enchType,
+            isAutocalc = false,
+            cost = castCost,
+            charge = charge,
+            effects = effects,
+        })
+        return world.createRecord(enchDraft).id
+    end)
+    if not ok then
+        addSoulPower(charge)  -- refund
+        dbg.error("AddEnchant", "Enchantment creation failed", tostring(enchOrErr))
+        dbg.endTimer("addEnchantment")
+        return false, "The machine could not imbue that enchantment"
+    end
+    local enchId = enchOrErr
+
+    local baseRecordId = itemBaseRecords[item.recordId] or item.recordId
+    local draft = typeMod.createRecordDraft({ template = record, enchant = enchId })
+    local newRecordId = world.createRecord(draft).id
+    itemBaseRecords[newRecordId] = baseRecordId
+
+    local newItem = world.createObject(newRecordId, 1)
+
+    -- Carry over condition; the new item arrives fully charged.
+    local newData = typeMod.itemData(newItem)
+    if newData then
+        if oldData and oldData.condition then newData.condition = oldData.condition end
+        newData.enchantmentCharge = charge
+    end
+
+    if actor and types.Actor.objectIsInstance(actor) then
+        newItem:moveInto(types.Actor.inventory(actor))
+    end
+    -- Consume one item from the stack; we only created one replacement.
+    item:remove(1)
+
+    dbg.info("AddEnchant", "Enchanted " .. (record.name or "item") .. " with " .. (spell.name or spellId) .. " (charge " .. charge .. ")")
+    dbg.incrementMetric("totalEnchantsAdded")
+    dbg.endTimer("addEnchantment")
+
+    return true, string.format(
+        "Imbued %s with %s. Soul power remaining: %d",
+        record.name or "item", spell.name or spellId, math.floor(remaining))
+end
+
 -- Calculate effective enchantment capacity for new enchantments
 local function getEffectiveEnchantCapacity(item)
     local settings = getSettings()
@@ -550,6 +682,10 @@ local function onRemoveEnchantEvent(eventData)
     handleOperationEvent('remove-enchant', removeEnchantment, eventData)
 end
 
+local function onAddEnchantEvent(eventData)
+    handleOperationEvent('add-enchant', addEnchantment, eventData)
+end
+
 -- Attune the resonator. Unlike the other operations this acts on a location, not
 -- an inventory item, so it bypasses handleOperationEvent (which requires `item`).
 -- Succeeds only inside the Heart chamber; sets the persistent `attuned` flag.
@@ -596,6 +732,7 @@ return {
         -- Item operations
         rechargeItem = rechargeItem,
         removeEnchantment = removeEnchantment,
+        addEnchantment = addEnchantment,
         canBeEnchanted = canBeEnchanted,
         getItemCapacity = getItemCapacity,
         getEffectiveEnchantCapacity = getEffectiveEnchantCapacity,
@@ -620,6 +757,7 @@ return {
         EnchantMachine_RechargeItem = onRechargeItemEvent,
         EnchantMachine_UpgradeItem = onUpgradeItemEvent,
         EnchantMachine_RemoveEnchant = onRemoveEnchantEvent,
+        EnchantMachine_AddEnchant = onAddEnchantEvent,
         EnchantMachine_Attune = onAttuneEvent,
 
         -- PLAYER pushes its current settings here so machine.getSettings() (the
