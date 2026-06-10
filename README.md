@@ -19,6 +19,8 @@ The result: Create enchanted items with 10x, 50x, or even 100x the normal capaci
 - **Story-Driven Discovery**: Defeat a unique boss encounter in vanilla Dwemer ruins to obtain the Remote
 - **Remote Control Device**: Ancient Dwemer puzzle box that opens the machine interface from anywhere
 - **Soul Power Bank**: Deposit filled soul gems to extract and store their soul power globally
+  - **Deposit All** empties every filled gem in one click, with a total-power preview
+  - **Azura's Star** is never consumed — it releases its soul and stays in your inventory
 - **Item Recharge**: Restore charges to enchanted items using stored soul power (1:1 ratio)
 - **Enhanced Enchanting**: Permanently increase item enchantment capacity before enchanting
   - Upgrade unenchanted items to have much higher capacity (configurable, default 100:1 soul power cost)
@@ -29,8 +31,14 @@ The result: Create enchanted items with 10x, 50x, or even 100x the normal capaci
   - Refunds soul power based on the enchantment's charge
   - Frees pre-enchanted artifacts to be re-enchanted via the normal enchanting system (or upgraded here first)
 - **Add Enchantment**: Creates a runtime enchantment record from one of your known spells and swaps it onto the selected item
+  - Choose the cast type: Cast on Strike (weapons), Cast on Use, or Constant Effect
+  - Searchable, paged spell list; name your creation as the final step
+- **Soul Siphon**: A machine-exclusive Cast-on-Strike enchantment (pinned at the top of the spell list) — every hit siphons soul power from the victim straight into the bank. Built on a custom OpenMW 0.51 magic effect; cannot be made Constant (the feedback loop would tear the machine apart)
 - **Custom Summons**: Mark a nearby creature, defeat it while marked, and learn a generated `Summon {creature}` spell with a 60-second duration
-- **Attune Resonator**: Attunes the device to the Heart of Lorkhan — only succeeds within the final Dagoth Ur chamber (`Akulakhan's Chamber`); sets a persistent attunement flag
+- **Attune Resonator**: Attunes the device to the Heart of Lorkhan — only succeeds within the final Dagoth Ur chamber (`Akulakhan's Chamber`). Attunement is permanent and grants:
+  - **Heart's Resonance**: a constant +50 Enchant ability (configurable 0–100 in settings, updates live)
+  - **Soul Resonance**: all deposited and siphoned souls yield 50% more power (enchantment-removal refunds are deliberately not amplified)
+  - Note: the Heart is destroyed at the end of the main quest — attune before then, or never
 
 ### Technical Features ✅
 - **No ESP Required**: Pure Lua + omwaddon implementation

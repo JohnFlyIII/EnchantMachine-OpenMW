@@ -68,6 +68,15 @@ local SUMMON_DURATION = 60
 local SUMMON_POLL_INTERVAL = 0.5
 local SUMMON_SCRIPT = "scripts/enchantmachine/summoned.lua"
 
+-- Soul Siphon effect/spell records are injected by load.lua via openmw.content.
+local SIPHON_EFFECT_ID = "em_soul_siphon"
+local SIPHON_SPELL_ID = "em_soul_siphon_spell"
+
+-- Reusable soul gems release their soul on deposit instead of being consumed.
+local REUSABLE_SOULGEMS = {
+    ["misc_soulgem_azura"] = true,  -- Azura's Star
+}
+
 -- Create a fresh encoded-scroll instance. Returns (object) or (nil, err) if the
 -- omwaddon record is missing (e.g. plugin not loaded / id changed in CS).
 local function createDwemerScroll()
@@ -82,8 +91,15 @@ local soulPower = 0
 local upgradedItems = {}
 local itemBaseRecords = {}  -- Maps upgraded item ID -> original base record ID
 local attuned = false       -- Set once the resonator is attuned at the Heart (Attune feature)
+local attuneAbility = nil   -- { id, magnitude } of the granted Heart's Resonance ability record
 local summonSpells = {}     -- Maps generated summon spell ID -> captured creature metadata
 local summonPollTimer = 0
+
+-- Soul Resonance: while attuned, deposited and siphoned souls yield 50% more
+-- power. Deliberately NOT applied to Remove Enchantment refunds — amplifying
+-- refunds would make enchant->remove->repeat print soul power. Keep in sync
+-- with RESONANCE_MULT in player_full.lua (menu previews).
+local RESONANCE_MULT = 1.5
 
 -- The interior cell holding the Heart of Lorkhan in Dagoth Ur's facility. Attune
 -- only succeeds while the player stands here; the vanilla cell name is matched
@@ -144,6 +160,7 @@ local defaultSettings = {
     enchantMultiplier = 10,
     upgradeRatio = 100,
     enableUpgradeFeature = false,
+    attuneEnchantBonus = 50,
 }
 
 -- Initialize settings with defaults
@@ -163,7 +180,74 @@ local function getSettings()
         enchantMultiplier = settingsData:get('enchantMultiplier'),
         upgradeRatio = settingsData:get('upgradeRatio'),
         enableUpgradeFeature = settingsData:get('enableUpgradeFeature'),
+        attuneEnchantBonus = settingsData:get('attuneEnchantBonus'),
     }
+end
+
+-- Soul Resonance multiplier (see RESONANCE_MULT above).
+local function resonantValue(value)
+    if attuned then
+        return math.floor(value * RESONANCE_MULT)
+    end
+    return value
+end
+
+-- Heart's Resonance: a constant Fortify Enchant ability granted on attunement.
+-- Abilities are always-on and persist in the save with their runtime-created
+-- spell record. The magnitude follows the attuneEnchantBonus setting; if it
+-- changes, syncAttunementAbility swaps the old ability for a fresh record.
+local function createAttuneAbilityRecord(bonus)
+    local draft = core.magic.spells.createRecordDraft({
+        name = "Heart's Resonance",
+        type = core.magic.SPELL_TYPE.Ability,
+        cost = 0,
+        isAutocalc = false,
+        starterSpellFlag = false,
+        effects = {
+            {
+                id = core.magic.EFFECT_TYPE.FortifySkill,
+                affectedSkill = 'enchant',
+                range = core.magic.RANGE.Self,
+                area = 0,
+                duration = 0,
+                magnitudeMin = bonus,
+                magnitudeMax = bonus,
+            },
+        },
+    })
+    return world.createRecord(draft).id
+end
+
+-- Idempotent: safe to call on attune, on settings change, and when a player
+-- joins (covers saves that attuned before this perk existed). No-op until
+-- attuned. bonus == 0 removes the ability entirely.
+local function syncAttunementAbility(player)
+    if not attuned then return end
+    player = isValidObject(player) and player or world.players[1]
+    if not isValidObject(player) or not types.Player.objectIsInstance(player) then return end
+
+    local bonus = math.max(0, math.floor(tonumber(settingsData:get('attuneEnchantBonus')) or 50))
+
+    local ok, err = pcall(function()
+        local spells = types.Actor.spells(player)
+        if attuneAbility and attuneAbility.magnitude ~= bonus then
+            if spells[attuneAbility.id] then
+                spells:remove(attuneAbility.id)
+            end
+            attuneAbility = nil
+        end
+        if bonus == 0 then return end
+        if not attuneAbility then
+            attuneAbility = { id = createAttuneAbilityRecord(bonus), magnitude = bonus }
+        end
+        if not spells[attuneAbility.id] then
+            spells:add(attuneAbility.id)
+            dbg.info("Attune", "Granted Heart's Resonance (+" .. bonus .. " Enchant)")
+        end
+    end)
+    if not ok then
+        dbg.error("Attune", "Ability sync failed", tostring(err))
+    end
 end
 
 -- Get current soul power in the bank
@@ -264,18 +348,78 @@ local function depositSoul(item, actor, settings)
         dbg.endTimer("depositSoul")
         return false, "Invalid soul"
     end
+    soulValue = resonantValue(soulValue)
 
-    -- Consume a single gem from the stack. Without the count, remove() takes the
-    -- whole stack while we'd only credit one gem's soul value.
-    item:remove(1)
+    -- Reusable gems (Azura's Star) release their soul; itemData.soul = nil is the
+    -- documented way to empty a gem. Ordinary gems are consumed: remove a single
+    -- gem from the stack — without the count, remove() takes the whole stack
+    -- while we'd only credit one gem's soul value.
+    local kept = REUSABLE_SOULGEMS[item.recordId]
+    if kept then
+        itemData.soul = nil
+    else
+        item:remove(1)
+    end
     local newTotal = addSoulPower(soulValue)
 
-    dbg.info("Deposit", "Deposited " .. soulValue .. " soul power")
+    dbg.info("Deposit", "Deposited " .. soulValue .. " soul power" .. (kept and " (gem kept)" or ""))
     dbg.incrementMetric("totalDeposits")
     dbg.trackMetric("totalSoulPowerAdded", soulValue)
     dbg.endTimer("depositSoul")
 
+    if kept then
+        return true, "The star releases its soul: " .. soulValue .. " power. Total: " .. newTotal
+    end
     return true, "Deposited " .. soulValue .. " soul power. Total: " .. newTotal
+end
+
+-- Deposit every filled soul gem in the actor's inventory at once. Stacks are
+-- handled per-entry: a stack of identical filled gems shares one itemData, so we
+-- credit soulValue * count and remove the whole stack. Reusable gems are emptied
+-- in place, never consumed.
+local function depositAllSouls(actor, settings)
+    dbg.startTimer("depositAllSouls")
+
+    settings = settings or getSettings()
+    if not settings.enableMachine then
+        dbg.endTimer("depositAllSouls")
+        return false, "Machine is disabled"
+    end
+
+    local total, gemCount = 0, 0
+    for _, item in ipairs(types.Actor.inventory(actor):getAll(types.Miscellaneous)) do
+        local itemData = types.Miscellaneous.itemData(item)
+        if itemData and itemData.soul then
+            local soulValue = resonantValue(getSoulValue(itemData.soul))
+            if soulValue > 0 then
+                if REUSABLE_SOULGEMS[item.recordId] then
+                    itemData.soul = nil
+                    total = total + soulValue
+                    gemCount = gemCount + 1
+                else
+                    local count = item.count or 1
+                    item:remove(count)
+                    total = total + soulValue * count
+                    gemCount = gemCount + count
+                end
+            end
+        end
+    end
+
+    if gemCount == 0 then
+        dbg.endTimer("depositAllSouls")
+        return false, "No filled soul gems to deposit"
+    end
+
+    local newTotal = addSoulPower(total)
+
+    dbg.info("Deposit", "Deposited " .. gemCount .. " souls for " .. total .. " power")
+    dbg.incrementMetric("totalDeposits")
+    dbg.trackMetric("totalSoulPowerAdded", total)
+    dbg.endTimer("depositAllSouls")
+
+    return true, string.format("Deposited %d souls for %d power. Total: %d",
+        gemCount, total, math.floor(newTotal))
 end
 
 -- Recharge an enchanted item using soul power
@@ -332,8 +476,9 @@ local function rechargeItem(item, actor, settings)
 end
 
 -- Upgrade an item's enchantment capacity by registering a new derived record
--- and swapping the inventory item to it.
-local function upgradeItemCapacity(item, capacityIncrease, actor, settings)
+-- and swapping the inventory item to it. customName (optional) renames the
+-- upgraded item.
+local function upgradeItemCapacity(item, capacityIncrease, actor, settings, customName)
     dbg.startTimer("upgradeItemCapacity")
 
     settings = settings or getSettings()
@@ -368,6 +513,10 @@ local function upgradeItemCapacity(item, capacityIncrease, actor, settings)
         return false, "Not enough soul power (need " .. soulCost .. ", have " .. soulPower .. ")"
     end
 
+    if type(customName) ~= 'string' or customName:match('^%s*$') then
+        customName = nil
+    end
+
     local _existingUpgrade, baseRecordId, baseCapacity = getItemUpgradeAmount(item, record, typeMod)
     local oldCapacity = record.enchantCapacity or baseCapacity
     local newCapacity = oldCapacity + capacityIncrease
@@ -375,7 +524,9 @@ local function upgradeItemCapacity(item, capacityIncrease, actor, settings)
     local ok, result = pcall(function()
         -- world.createRecord auto-generates the id (the draft.id field is ignored),
         -- so we always register a fresh record and trust the returned id.
-        local draft = typeMod.createRecordDraft({ template = record, enchantCapacity = newCapacity })
+        local draftSpec = { template = record, enchantCapacity = newCapacity }
+        if customName then draftSpec.name = customName end
+        local draft = typeMod.createRecordDraft(draftSpec)
         local newRecordId = world.createRecord(draft).id
         local newItem = world.createObject(newRecordId, 1)
 
@@ -405,11 +556,12 @@ local function upgradeItemCapacity(item, capacityIncrease, actor, settings)
     itemBaseRecords[result.newRecordId] = baseRecordId
     setUpgradedCapacity(result.newRecordId, newCapacity - baseCapacity)
 
-    dbg.info("Upgrade", "Upgraded " .. record.name .. " " .. baseCapacity .. " -> " .. newCapacity .. " (base " .. baseRecordId .. ")")
+    local shownName = customName or record.name
+    dbg.info("Upgrade", "Upgraded " .. shownName .. " " .. baseCapacity .. " -> " .. newCapacity .. " (base " .. baseRecordId .. ")")
     dbg.incrementMetric("totalUpgrades")
     dbg.endTimer("upgradeItemCapacity")
 
-    return true, "Upgraded " .. record.name .. " capacity from " .. math.floor(oldCapacity) .. " to " .. math.floor(newCapacity) .. ". Soul power remaining: " .. math.floor(newTotal)
+    return true, "Upgraded " .. shownName .. " capacity from " .. math.floor(oldCapacity) .. " to " .. math.floor(newCapacity) .. ". Soul power remaining: " .. math.floor(newTotal)
 end
 
 -- Remove an item's enchantment by registering a derived record with the enchant
@@ -494,9 +646,18 @@ end
 -- failed on this engine because EnchantingDialog needs an engine-side Ptr that the
 -- Lua API can't supply. Same record-swap pattern as upgrade/remove.
 --
--- Weapons cast on strike; armor & clothing cast on use. The charge pool is the
--- item's capacity scaled by enchantMultiplier (the mod's signature boost), and we
--- fill it to full up front for `charge` soul power (1:1, consistent with recharge).
+-- The cast type comes from the menu as eventData.enchantType (a key of
+-- PLAYER_ENCHANT_TYPES); older callers that omit it get the legacy default of
+-- strike for weapons, use for armor & clothing. The charge pool is the item's
+-- capacity scaled by enchantMultiplier (the mod's signature boost), and we fill
+-- it to full up front for `charge` soul power (1:1, consistent with recharge).
+-- Constant Effect ignores charge in-engine, but is priced the same here.
+local PLAYER_ENCHANT_TYPES = {
+    CastOnStrike = core.magic.ENCHANTMENT_TYPE.CastOnStrike,
+    CastOnUse = core.magic.ENCHANTMENT_TYPE.CastOnUse,
+    ConstantEffect = core.magic.ENCHANTMENT_TYPE.ConstantEffect,
+}
+
 local function addEnchantment(item, actor, settings, eventData)
     dbg.startTimer("addEnchantment")
 
@@ -552,9 +713,37 @@ local function addEnchantment(item, actor, settings, eventData)
         return false, "That spell has no usable effects"
     end
 
-    local enchType = (typeMod == types.Weapon)
-        and core.magic.ENCHANTMENT_TYPE.CastOnStrike
-        or core.magic.ENCHANTMENT_TYPE.CastOnUse
+    local enchType
+    local requestedType = eventData and eventData.enchantType
+    if requestedType then
+        enchType = PLAYER_ENCHANT_TYPES[requestedType]
+        if not enchType then
+            dbg.endTimer("addEnchantment")
+            return false, "Unknown enchantment type: " .. tostring(requestedType)
+        end
+        if enchType == core.magic.ENCHANTMENT_TYPE.CastOnStrike and typeMod ~= types.Weapon then
+            dbg.endTimer("addEnchantment")
+            return false, "Only weapons can cast on strike"
+        end
+    else
+        enchType = (typeMod == types.Weapon)
+            and core.magic.ENCHANTMENT_TYPE.CastOnStrike
+            or core.magic.ENCHANTMENT_TYPE.CastOnUse
+    end
+
+    -- Constant effects only work self-targeted (matching the vanilla enchanter,
+    -- which restricts constant enchantments to Self-range effects). Soul Siphon
+    -- is banned here: a constant self-siphon re-applies forever and the poll
+    -- would bank power in an infinite loop.
+    if enchType == core.magic.ENCHANTMENT_TYPE.ConstantEffect then
+        for _, e in ipairs(effects) do
+            if e.id == SIPHON_EFFECT_ID then
+                dbg.endTimer("addEnchantment")
+                return false, "Soul Siphon cannot be made constant — the feedback would tear the machine apart"
+            end
+            e.range = core.magic.RANGE.Self
+        end
+    end
 
     local multiplier = settings.enchantMultiplier or 10
     local charge = math.floor((record.enchantCapacity or 0) * multiplier)
@@ -570,6 +759,12 @@ local function addEnchantment(item, actor, settings, eventData)
         return false, "Not enough soul power (need " .. charge .. ", have " .. soulPower .. ")"
     end
 
+    -- Optional player-chosen display name for the created item.
+    local customName = eventData and eventData.customName
+    if type(customName) ~= 'string' or customName:match('^%s*$') then
+        customName = nil
+    end
+
     -- Build the enchantment record, then a derived item record pointing at it.
     -- Guard creation: a bad effect set should report, not hard-error or charge the bank.
     local existingUpgrade, baseRecordId = getItemUpgradeAmount(item, record, typeMod)
@@ -583,7 +778,9 @@ local function addEnchantment(item, actor, settings, eventData)
         })
         local enchId = world.createRecord(enchDraft).id
 
-        local draft = typeMod.createRecordDraft({ template = record, enchant = enchId })
+        local draftSpec = { template = record, enchant = enchId }
+        if customName then draftSpec.name = customName end
+        local draft = typeMod.createRecordDraft(draftSpec)
         local newRecordId = world.createRecord(draft).id
         local newItem = world.createObject(newRecordId, 1)
 
@@ -615,13 +812,14 @@ local function addEnchantment(item, actor, settings, eventData)
     itemBaseRecords[result.newRecordId] = baseRecordId
     setUpgradedCapacity(result.newRecordId, existingUpgrade)
 
-    dbg.info("AddEnchant", "Enchanted " .. (record.name or "item") .. " with " .. (spell.name or spellId) .. " (charge " .. charge .. ")")
+    local shownName = customName or record.name or "item"
+    dbg.info("AddEnchant", "Enchanted " .. shownName .. " with " .. (spell.name or spellId) .. " (charge " .. charge .. ")")
     dbg.incrementMetric("totalEnchantsAdded")
     dbg.endTimer("addEnchantment")
 
     return true, string.format(
         "Imbued %s with %s. Soul power remaining: %d",
-        record.name or "item", spell.name or spellId, math.floor(remaining))
+        shownName, spell.name or spellId, math.floor(remaining))
 end
 
 -- Calculate effective enchantment capacity for new enchantments
@@ -798,11 +996,57 @@ local function checkSummonCasts()
     end
 end
 
+-- Soul Siphon: the custom effect has no engine behaviour, so we poll active
+-- actors for it. Each strike with a siphon enchantment puts a fresh active spell
+-- on the victim (3s duration, comfortably longer than the 0.5s poll); we bank
+-- the rolled magnitude as soul power and strip the active spell so it can't be
+-- banked twice. Removals are collected first — mutating the active-spell list
+-- while iterating it is undefined.
+local function checkSoulSiphons(player)
+    local totalSiphoned = 0
+    for _, actor in ipairs(world.activeActors) do
+        if isValidObject(actor) then
+            local activeSpells = types.Actor.activeSpells(actor)
+            local toRemove = {}
+            for _, activeSpell in pairs(activeSpells) do
+                local siphoned = 0
+                for _, effect in pairs(activeSpell.effects) do
+                    if effect.id == SIPHON_EFFECT_ID then
+                        siphoned = siphoned
+                            + math.max(1, math.floor(effect.magnitudeThisFrame or effect.minMagnitude or 1))
+                    end
+                end
+                if siphoned > 0 then
+                    table.insert(toRemove, activeSpell.activeSpellId)
+                    totalSiphoned = totalSiphoned + siphoned
+                end
+            end
+            for _, activeSpellId in ipairs(toRemove) do
+                pcall(function() activeSpells:remove(activeSpellId) end)
+            end
+        end
+    end
+
+    if totalSiphoned > 0 then
+        totalSiphoned = resonantValue(totalSiphoned)
+        addSoulPower(totalSiphoned)
+        dbg.info("Siphon", "Siphoned " .. totalSiphoned .. " soul power")
+        dbg.trackMetric("totalSoulPowerAdded", totalSiphoned)
+        if isValidObject(player) then
+            player:sendEvent('EnchantMachine_Message', {
+                success = true,
+                message = "Siphoned " .. totalSiphoned .. " soul power.",
+            })
+        end
+    end
+end
+
 local function onUpdate(dt)
     summonPollTimer = summonPollTimer + dt
     if summonPollTimer < SUMMON_POLL_INTERVAL then return end
     summonPollTimer = 0
     checkSummonCasts()
+    checkSoulSiphons(world.players[1])
 end
 
 -- ItemUsage handlers don't persist across save/load — must be re-registered from
@@ -831,11 +1075,12 @@ end
 local function onSave()
     dbg.info("Save", "Saving soul power: " .. soulPower)
     return {
-        version = 4,
+        version = 5,
         soulPower = soulPower,
         upgradedItems = upgradedItems,
         itemBaseRecords = itemBaseRecords,
         attuned = attuned,
+        attuneAbility = attuneAbility,
         summonSpells = summonSpells,
     }
 end
@@ -847,7 +1092,9 @@ local function onLoad(data)
         itemBaseRecords = data.itemBaseRecords or {}
         -- attuned added in v3; older saves default to false.
         attuned = data.attuned or false
-        -- summonSpells added in v4.
+        -- summonSpells added in v4; attuneAbility in v5 (granted on next
+        -- onPlayerAdded for older attuned saves).
+        attuneAbility = data.attuneAbility
         summonSpells = data.summonSpells or {}
         dbg.info("Load", "Loaded soul power " .. soulPower)
     else
@@ -855,6 +1102,7 @@ local function onLoad(data)
         upgradedItems = {}
         itemBaseRecords = {}
         attuned = false
+        attuneAbility = nil
         summonSpells = {}
         dbg.info("Load", "New game, starting at 0 soul power")
     end
@@ -897,13 +1145,27 @@ local function onDepositGemEvent(eventData)
     handleOperationEvent('deposit', depositSoul, eventData)
 end
 
+-- Deposit All acts on the whole inventory, not a single item, so it bypasses
+-- handleOperationEvent (which requires `item`).
+local function onDepositAllEvent(eventData)
+    local actor = eventData and eventData.actor
+    if not actor then return end
+
+    local success, message = depositAllSouls(actor, eventData.settings)
+    actor:sendEvent('EnchantMachine_Result', {
+        success = success,
+        message = message,
+        operation = 'deposit',
+    })
+end
+
 local function onRechargeItemEvent(eventData)
     handleOperationEvent('recharge', rechargeItem, eventData)
 end
 
 local function onUpgradeItemEvent(eventData)
     handleOperationEvent('upgrade', function(item, actor, settings, ev)
-        return upgradeItemCapacity(item, ev.amount or 1, actor, settings)
+        return upgradeItemCapacity(item, ev.amount or 1, actor, settings, ev.customName)
     end, eventData)
 end
 
@@ -960,6 +1222,7 @@ local function onAttuneEvent(eventData)
     if ok then
         attuned = true
         updateSharedData()
+        syncAttunementAbility(actor)
         dbg.info("Attune", "Resonator attuned at " .. FINAL_CHAMBER_CELL)
     else
         dbg.info("Attune", "Attune failed in cell " .. ((cell and cell.name) or "?"))
@@ -968,7 +1231,8 @@ local function onAttuneEvent(eventData)
     actor:sendEvent('EnchantMachine_Result', {
         success = ok,
         operation = 'attune',
-        message = ok and "The resonator sings in answer to the Heart. Attunement complete."
+        message = ok and ("The resonator sings in answer to the Heart. Attunement complete. "
+                .. "Souls now resonate with greater power, and Kagrenac's craft steadies your hands.")
             or "The device failed to attune.",
     })
 end
@@ -986,6 +1250,7 @@ return {
 
         -- Soul gem operations
         depositSoul = depositSoul,
+        depositAllSouls = depositAllSouls,
 
         -- Custom item creation
         createRemoteItem = createRemoteItem,
@@ -1019,9 +1284,13 @@ return {
         onUpdate = onUpdate,
         onSave = onSave,
         onLoad = onLoad,
+        -- Re-grant Heart's Resonance when the player joins: covers saves that
+        -- attuned before the perk existed and any failed earlier grant.
+        onPlayerAdded = function(player) syncAttunementAbility(player) end,
     },
     eventHandlers = {
         EnchantMachine_DepositGem = onDepositGemEvent,
+        EnchantMachine_DepositAll = onDepositAllEvent,
         EnchantMachine_RechargeItem = onRechargeItemEvent,
         EnchantMachine_UpgradeItem = onUpgradeItemEvent,
         EnchantMachine_RemoveEnchant = onRemoveEnchantEvent,
@@ -1036,11 +1305,15 @@ return {
         -- rather than the default fallbacks.
         EnchantMachine_SyncSettings = function(data)
             if not data then return end
-            for _, key in ipairs({'enableMachine', 'enchantMultiplier', 'upgradeRatio', 'enableUpgradeFeature'}) do
+            for _, key in ipairs({'enableMachine', 'enchantMultiplier', 'upgradeRatio',
+                                  'enableUpgradeFeature', 'attuneEnchantBonus'}) do
                 if data[key] ~= nil then
                     settingsData:set(key, data[key])
                 end
             end
+            -- Live-reswap Heart's Resonance if the bonus setting changed (no-op
+            -- unless attuned and the magnitude actually differs).
+            syncAttunementAbility()
         end,
 
         -- Debug: spawn a remote into the player's inventory (callable from console).

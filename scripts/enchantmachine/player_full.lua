@@ -78,6 +78,14 @@ I.Settings.registerGroup({
             default = false,
         },
         {
+            key = 'attuneEnchantBonus',
+            renderer = 'number',
+            name = 'Attunement Enchant Bonus',
+            description = 'Constant Enchant skill bonus granted while attuned to the Heart (0 disables; takes effect immediately)',
+            default = 50,
+            argument = { integer = true, min = 0, max = 100 },
+        },
+        {
             key = 'howToAccess',
             renderer = 'textLine',
             name = 'How to Access Machine',
@@ -131,7 +139,9 @@ local showUpgradeMenu
 local showUpgradeAmountMenu
 local showRemoveEnchantMenu
 local showAddEnchantMenu
+local showEnchantTypeMenu
 local showSpellSelectMenu
+local showNameItemMenu
 local showCaptureSummonMenu
 local attuneResonator
 
@@ -143,6 +153,7 @@ local function getSettings()
         enchantMultiplier = configSettings:get('enchantMultiplier'),
         upgradeRatio = configSettings:get('upgradeRatio'),
         enableUpgradeFeature = configSettings:get('enableUpgradeFeature'),
+        attuneEnchantBonus = configSettings:get('attuneEnchantBonus'),
     }
 end
 
@@ -168,6 +179,22 @@ end
 
 local function getSoulPower()
     return sharedData:get('soulPower') or 0
+end
+
+local function isAttuned()
+    return sharedData:get('attuned') or false
+end
+
+-- Soul Resonance: while attuned, deposited and siphoned souls yield 50% more
+-- power. Must match RESONANCE_MULT in global.lua — this copy only drives the
+-- menu previews; GLOBAL owns the actual banking math.
+local RESONANCE_MULT = 1.5
+
+local function resonantValue(value)
+    if isAttuned() then
+        return math.floor(value * RESONANCE_MULT)
+    end
+    return value
 end
 
 local function closeMenu()
@@ -202,7 +229,8 @@ end
 local function spacer(height)
     return {
         type = ui.TYPE.Flex,
-        props = { size = util.vector2(0, height) },
+        -- autoSize must be off or Flex ignores `size` and collapses to 0 height.
+        props = { autoSize = false, size = util.vector2(0, height) },
     }
 end
 
@@ -237,6 +265,26 @@ local function bareHeader(text, size)
         type = ui.TYPE.Text,
         template = I.MWUI.templates.textHeader,
         props = { text = text, textSize = size or 30 },
+    }
+end
+
+-- Single-line text input. `props` is a caller-owned table: keep props.text in
+-- sync inside onChanged, so if the widget is ever recreated by an update() it
+-- doesn't reset to the stale initial text.
+local function textInput(props, onChanged)
+    return {
+        template = I.MWUI.templates.textEditLine,
+        props = props,
+        events = { textChanged = async:callback(onChanged) },
+    }
+end
+
+-- A horizontal row of pre-built nodes, centered on the cross axis.
+local function buttonRow(nodes)
+    return {
+        type = ui.TYPE.Flex,
+        props = { horizontal = true, arrange = ui.ALIGNMENT.Center },
+        content = ui.content(nodes),
     }
 end
 
@@ -303,8 +351,10 @@ createMenu = function(opts)
         content = ui.content{
             {
                 type = ui.TYPE.Flex,
+                -- Flex's orientation prop is `horizontal` (false = vertical, the
+                -- default). There is no `vertical` prop — 0.51's widget validation
+                -- warns on unrecognised fields.
                 props = {
-                    vertical = true,
                     arrange = ui.ALIGNMENT.Center,
                     align = ui.ALIGNMENT.Center,
                 },
@@ -341,6 +391,7 @@ local function getFilledSoulGems()
                     soul = itemData.soul,
                     soulName = soulName,
                     soulValue = soulValue,
+                    count = item.count or 1,
                 })
             end
         end
@@ -486,12 +537,39 @@ showDepositMenu = function()
     end
 
     local items = {}
+
+    -- Deposit All: preview the haul in the label. Mirrors GLOBAL's stack math
+    -- (resonant soulValue * stack count); Azura's Star counts once and is kept.
+    local totalPower, totalGems = 0, 0
+    for _, gem in ipairs(gems) do
+        totalPower = totalPower + resonantValue(gem.soulValue or 0) * gem.count
+        totalGems = totalGems + gem.count
+    end
+    if totalGems > 1 then
+        table.insert(items, createButton(
+            string.format("Deposit All (%d souls, %d power)", totalGems, totalPower),
+            function()
+                core.sendGlobalEvent('EnchantMachine_DepositAll', {
+                    actor = self.object,
+                    settings = getSettings(),
+                })
+                ui.showMessage("Depositing all soul gems...")
+                closeMenu()
+            end
+        ))
+        table.insert(items, spacer(6))
+    end
+
     for _, gem in ipairs(gems) do
         local gemName = (gem.record and gem.record.name) or "Soul Gem"
         local soulName = gem.soulName or gem.soul or "Unknown"
-        local label = gemName .. " (" .. soulName
+        local label = gemName
+        if gem.count > 1 then
+            label = label .. " x" .. gem.count
+        end
+        label = label .. " (" .. soulName
         if (gem.soulValue or 0) > 0 then
-            label = label .. " - " .. gem.soulValue .. " power"
+            label = label .. " - " .. resonantValue(gem.soulValue) .. " power"
         end
         label = label .. ")"
         table.insert(items, createButton(
@@ -510,7 +588,10 @@ showDepositMenu = function()
 
     createMenu{
         header = { type = 'boxed', text = "Deposit Soul Gems" },
-        info = "Select a soul gem to deposit. Gems are consumed permanently.",
+        info = isAttuned()
+            and "Select a soul gem to deposit. The Heart's resonance amplifies souls by 50%."
+            or "Select a soul gem to deposit. Gems are consumed permanently.",
+        warning = "Azura's Star only releases its soul — the star itself is never consumed.",
         items = items,
         onBack = function() createMainMenu() end,
     }
@@ -603,32 +684,109 @@ showUpgradeAmountMenu = function(entry, ratio, soulPower)
 
     local itemName = entry.record.name or "Item"
     local currentCapacity = math.floor(entry.record.enchantCapacity or 0)
+    local maxAffordable = math.floor(soulPower / ratio)
+
+    -- Optional rename, applied by whichever upgrade button is clicked.
+    -- Whitespace-only means "keep the current name" (GLOBAL ignores it).
+    local renameTyped = ''
+    local renameProps = { text = '', size = util.vector2(240, 24) }
+
+    local function sendUpgrade(amount)
+        core.sendGlobalEvent('EnchantMachine_UpgradeItem', {
+            actor = self.object,
+            item = entry.item,
+            amount = amount,
+            customName = renameTyped,
+            settings = getSettings(),
+        })
+        ui.showMessage("Upgrading item...")
+        closeMenu()
+    end
 
     local items = {}
-    for _, amount in ipairs({1, 5, 10, 25, 50, 100}) do
+    table.insert(items, textLine("Rename (optional):"))
+    table.insert(items, textInput(renameProps, function(text)
+        renameProps.text = text
+        renameTyped = text
+    end))
+    table.insert(items, spacer(10))
+    for _, amount in ipairs({1, 10, 100}) do
         local cost = amount * ratio
         local canAfford = soulPower >= cost
-        local newCapacity = currentCapacity + amount
         table.insert(items, createButton(
-            string.format("+%d capacity (%d power) → %d total", amount, cost, newCapacity),
-            function()
-                core.sendGlobalEvent('EnchantMachine_UpgradeItem', {
-                    actor = self.object,
-                    item = entry.item,
-                    amount = amount,
-                    settings = getSettings(),
-                })
-                ui.showMessage("Upgrading item...")
-                closeMenu()
-            end,
+            string.format("+%d capacity (%d power) → %d total", amount, cost, currentCapacity + amount),
+            function() sendUpgrade(amount) end,
             canAfford
         ))
     end
+    if maxAffordable > 0 then
+        table.insert(items, createButton(
+            string.format("+%d capacity (Max affordable, %d power)", maxAffordable, maxAffordable * ratio),
+            function() sendUpgrade(maxAffordable) end
+        ))
+    end
+
+    -- Custom amount: a text box validated live against the exchange rate and the
+    -- bank balance. customAmount is nil until the box holds a whole number.
+    local customAmount = nil
+    local editProps = { text = '', size = util.vector2(240, 24) }
+    local statusProps = {
+        text = string.format("Type an amount and Apply (max affordable: %d)", maxAffordable),
+        textSize = 14,
+    }
+
+    local function onAmountChanged(text)
+        editProps.text = text
+        customAmount = tonumber(text:match('^%s*(%d+)%s*$') or '')
+        if customAmount and customAmount >= 1 then
+            local cost = customAmount * ratio
+            if cost <= soulPower then
+                statusProps.text = string.format("+%d capacity costs %d power → %d total",
+                    customAmount, cost, currentCapacity + customAmount)
+                statusProps.textColor = util.color.rgb(0.5, 1, 0.5)
+            else
+                statusProps.text = string.format("Costs %d power — you only have %d",
+                    cost, math.floor(soulPower))
+                statusProps.textColor = util.color.rgb(1, 0.4, 0.4)
+            end
+        else
+            customAmount = nil
+            statusProps.text = text == '' and
+                string.format("Type an amount and Apply (max affordable: %d)", maxAffordable)
+                or "Enter a whole number"
+            statusProps.textColor = nil
+        end
+        -- The status node's layout table is mutated in place; update() applies it
+        -- without recreating the (focused) text edit widget.
+        if currentMenu then currentMenu:update() end
+    end
+
+    table.insert(items, spacer(10))
+    table.insert(items, textLine("Custom amount:"))
+    table.insert(items, textInput(editProps, onAmountChanged))
+    table.insert(items, {
+        type = ui.TYPE.Text,
+        template = I.MWUI.templates.textNormal,
+        props = statusProps,
+    })
+    table.insert(items, createButton("Apply Custom Amount", function()
+        if not customAmount then
+            ui.showMessage("Enter a whole number of capacity points first.")
+            return
+        end
+        local cost = customAmount * ratio
+        if cost > soulPower then
+            ui.showMessage(string.format("Not enough soul power (need %d, have %d).",
+                cost, math.floor(soulPower)))
+            return
+        end
+        sendUpgrade(customAmount)
+    end))
 
     createMenu{
         header = { type = 'boxed', text = "Upgrade: " .. itemName },
-        info = string.format("Current Capacity: %d | Soul Power: %d",
-            currentCapacity, math.floor(soulPower)),
+        info = string.format("Current Capacity: %d | Soul Power: %d | Rate: %d power per point",
+            currentCapacity, math.floor(soulPower), ratio),
         items = items,
         onBack = showUpgradeMenu,
     }
@@ -690,19 +848,55 @@ showAddEnchantMenu = function()
         local capacity = math.floor(entry.record.enchantCapacity or 0)
         table.insert(items, createButton(
             string.format("%s (Capacity: %d)", itemName, capacity),
-            function() showSpellSelectMenu(entry) end
+            function() showEnchantTypeMenu(entry) end
         ))
     end
 
     createMenu{
         header = { type = 'boxed', text = "Add Enchantment" },
-        info = "Choose an item, then a known spell to imbue into it.",
+        info = "Choose an item, then how it casts, then a known spell to imbue.",
         items = items,
         onBack = function() createMainMenu() end,
     }
 end
 
-showSpellSelectMenu = function(entry)
+-- Cast-type descriptions shown on the spell-select screen. Keys are the strings
+-- sent to GLOBAL as eventData.enchantType (mapped there to ENCHANTMENT_TYPE).
+local ENCHANT_TYPE_INFO = {
+    CastOnStrike = { label = "Cast on Strike", note = "Casts on whatever the weapon hits. Item arrives fully charged." },
+    CastOnUse = { label = "Cast on Use", note = "Cast manually like a magic item. Item arrives fully charged." },
+    ConstantEffect = { label = "Constant Effect", note = "Always active while equipped; effects become self-targeted. Never needs charge." },
+}
+
+showEnchantTypeMenu = function(entry)
+    closeMenu()
+
+    -- Cast on Strike is weapon-only; everything enchantable can take the others.
+    local typeKeys = { 'CastOnUse', 'ConstantEffect' }
+    if types.Weapon.objectIsInstance(entry.item) then
+        table.insert(typeKeys, 1, 'CastOnStrike')
+    end
+
+    local items = {}
+    for _, key in ipairs(typeKeys) do
+        table.insert(items, createButton(
+            ENCHANT_TYPE_INFO[key].label,
+            function() showSpellSelectMenu(entry, key) end
+        ))
+    end
+
+    createMenu{
+        header = { type = 'boxed', text = "Enchant: " .. (entry.record.name or "Item") },
+        info = "How should the enchantment trigger?",
+        warning = "Constant Effect stays active while the item is equipped.",
+        items = items,
+        onBack = function() showAddEnchantMenu() end,
+    }
+end
+
+local SPELL_PAGE_SIZE = 10
+
+showSpellSelectMenu = function(entry, enchantType)
     closeMenu()
 
     local spells = getKnownSpells()
@@ -710,6 +904,23 @@ showSpellSelectMenu = function(entry)
         ui.showMessage("You know no castable spells to imbue.")
         async:newUnsavableSimulationTimer(1.5, function() showAddEnchantMenu() end)
         return
+    end
+    table.sort(spells, function(a, b)
+        return (a.name or a.id):lower() < (b.name or b.id):lower()
+    end)
+
+    -- Pin the machine's Soul Siphon template for strike enchantments. The player
+    -- never "knows" this spell — it's machine tech injected by load.lua, and the
+    -- effect feeds soul power straight into the bank on every hit.
+    if enchantType == 'CastOnStrike' then
+        local siphon = core.magic.spells.records['em_soul_siphon_spell']
+        if siphon then
+            local known = false
+            for _, s in ipairs(spells) do
+                if s.id == siphon.id then known = true; break end
+            end
+            if not known then table.insert(spells, 1, siphon) end
+        end
     end
 
     local soulPower = getSoulPower()
@@ -719,31 +930,128 @@ showSpellSelectMenu = function(entry)
     local charge = math.floor((entry.record.enchantCapacity or 0) * multiplier)
     local canAfford = soulPower >= charge
 
-    local items = {}
-    for _, spell in ipairs(spells) do
+    local function spellButton(spell)
         local spellName = spell.name or spell.id
-        table.insert(items, createButton(
+        return createButton(
             string.format("%s (cost %d)", spellName, math.floor(spell.cost or 0)),
-            function()
-                core.sendGlobalEvent('EnchantMachine_AddEnchant', {
-                    actor = self.object,
-                    item = entry.item,
-                    spellId = spell.id,
-                    settings = getSettings(),
-                })
-                ui.showMessage("Imbuing enchantment...")
-                closeMenu()
-            end,
+            function() showNameItemMenu(entry, enchantType, spell) end,
             canAfford
-        ))
+        )
+    end
+
+    -- Search box + paged list. MWUI has no scroll container, so the list is
+    -- capped at SPELL_PAGE_SIZE with Prev/Next paging, and the search box
+    -- filters by name. listFlex is mutated in place and currentMenu:update()
+    -- applies the change without recreating the focused text edit.
+    local searchText = ''
+    local page = 1
+    local searchProps = { text = '', size = util.vector2(240, 24) }
+    local listFlex = {
+        type = ui.TYPE.Flex,
+        props = { arrange = ui.ALIGNMENT.Center },
+        content = ui.content{},
+    }
+
+    local function rebuildList()
+        local needle = searchText:lower()
+        local matches = {}
+        for _, spell in ipairs(spells) do
+            if needle == '' or (spell.name or spell.id):lower():find(needle, 1, true) then
+                table.insert(matches, spell)
+            end
+        end
+
+        local pageCount = math.max(1, math.ceil(#matches / SPELL_PAGE_SIZE))
+        if page > pageCount then page = pageCount end
+
+        local nodes = {}
+        if #matches == 0 then
+            table.insert(nodes, textLine("No known spells match.", { size = 14 }))
+        end
+        local first = (page - 1) * SPELL_PAGE_SIZE + 1
+        for i = first, math.min(first + SPELL_PAGE_SIZE - 1, #matches) do
+            table.insert(nodes, spellButton(matches[i]))
+        end
+        if pageCount > 1 then
+            table.insert(nodes, buttonRow{
+                createButton("< Prev", function()
+                    page = page - 1
+                    rebuildList()
+                end, page > 1),
+                textLine(string.format("  Page %d/%d (%d spells)  ", page, pageCount, #matches)),
+                createButton("Next >", function()
+                    page = page + 1
+                    rebuildList()
+                end, page < pageCount),
+            })
+        end
+
+        listFlex.content = ui.content(nodes)
+        if currentMenu then currentMenu:update() end
+    end
+
+    rebuildList()
+
+    local typeInfo = ENCHANT_TYPE_INFO[enchantType] or ENCHANT_TYPE_INFO.CastOnUse
+    createMenu{
+        header = { type = 'boxed', text = "Imbue: " .. (entry.record.name or "Item") },
+        info = string.format("%s | Soul Power: %d | Cost to enchant: %d power",
+            typeInfo.label, math.floor(soulPower), charge),
+        warning = typeInfo.note,
+        items = {
+            textLine("Search:"),
+            textInput(searchProps, function(text)
+                searchProps.text = text
+                searchText = text
+                page = 1
+                rebuildList()
+            end),
+            spacer(6),
+            listFlex,
+        },
+        onBack = function() showEnchantTypeMenu(entry) end,
+    }
+end
+
+-- Final step of the imbue flow: optionally name the creation, then send the
+-- AddEnchant event. A blank name keeps the item's original name.
+showNameItemMenu = function(entry, enchantType, spell)
+    closeMenu()
+
+    local originalName = entry.record.name or "Item"
+    local typed = ''
+    local nameProps = { text = '', size = util.vector2(240, 24) }
+
+    local function imbue()
+        local name = typed:gsub('^%s+', ''):gsub('%s+$', '')
+        if #name > 48 then name = name:sub(1, 48) end
+        core.sendGlobalEvent('EnchantMachine_AddEnchant', {
+            actor = self.object,
+            item = entry.item,
+            spellId = spell.id,
+            enchantType = enchantType,
+            customName = name ~= '' and name or nil,
+            settings = getSettings(),
+        })
+        ui.showMessage("Imbuing enchantment...")
+        closeMenu()
     end
 
     createMenu{
-        header = { type = 'boxed', text = "Imbue: " .. (entry.record.name or "Item") },
-        info = string.format("Soul Power: %d | Cost to enchant: %d power", math.floor(soulPower), charge),
-        warning = "Weapons cast on strike; armor & clothing cast on use. Item arrives fully charged.",
-        items = items,
-        onBack = function() showAddEnchantMenu() end,
+        header = { type = 'boxed', text = "Name Your Creation" },
+        info = string.format("Imbuing %s with %s (%s)",
+            originalName, spell.name or spell.id,
+            (ENCHANT_TYPE_INFO[enchantType] or ENCHANT_TYPE_INFO.CastOnUse).label),
+        warning = "Leave blank to keep the name \"" .. originalName .. "\".",
+        items = {
+            textInput(nameProps, function(text)
+                nameProps.text = text
+                typed = text
+            end),
+            spacer(10),
+            createButton("Imbue", imbue),
+        },
+        onBack = function() showSpellSelectMenu(entry, enchantType) end,
     }
 end
 
@@ -807,7 +1115,12 @@ createMainMenu = function()
         table.insert(items, textLine("[Upgrade Capacity - Locked]",
             { size = 18, color = util.color.rgb(0.5, 0.5, 0.5) }))
     end
-    table.insert(items, createButton("Attune Resonator", attuneResonator))
+    if isAttuned() then
+        table.insert(items, textLine("* Attuned to the Heart *",
+            { size = 14, color = util.color.rgb(1, 0.85, 0.4) }))
+    else
+        table.insert(items, createButton("Attune Resonator", attuneResonator))
+    end
     table.insert(items, spacer(20))
     table.insert(items, createButton("Exit", closeMenu))
 
