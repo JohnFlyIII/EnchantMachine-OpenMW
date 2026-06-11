@@ -69,11 +69,12 @@ content.magicEffects.records[SIPHON_EFFECT_ID] = {
 -- The imbue template the machine offers for Cast-on-Strike enchantments. Not
 -- taught to the player; the spell-select menu pins it at the top of the list.
 -- Duration must comfortably outlast GLOBAL's 0.5s siphon poll so hits between
--- polls aren't lost.
+-- polls aren't lost. cost becomes the enchantment's PER-STRIKE charge cost —
+-- keep it low or a modest charge pool only covers a couple of swings.
 content.spells.records[SIPHON_SPELL_ID] = {
     name = "Soul Siphon",
     type = content.spells.TYPE.Spell,
-    cost = 50,
+    cost = 5,
     isAutocalc = false,
     starterSpellFlag = false,
     effects = {

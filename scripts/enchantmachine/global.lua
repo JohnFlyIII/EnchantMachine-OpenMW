@@ -33,6 +33,25 @@ local function getEnchantable(item)
     end
 end
 
+-- Copy a record's MagicEffectWithParams list into plain tables appended to dst
+-- (createRecordDraft wants plain data; the same field set is shared by spells
+-- and enchantments). Returns dst.
+local function appendEffects(dst, list)
+    for _, e in ipairs(list) do
+        dst[#dst + 1] = {
+            id = e.id,
+            affectedSkill = e.affectedSkill,
+            affectedAttribute = e.affectedAttribute,
+            range = e.range,
+            area = e.area,
+            magnitudeMin = e.magnitudeMin,
+            magnitudeMax = e.magnitudeMax,
+            duration = e.duration,
+        }
+    end
+    return dst
+end
+
 -- The name used to identify the enchanting machine remote control.
 -- We match by name (not recordId) because world.createRecord auto-generates IDs.
 local REMOTE_ITEM_NAME = "Dwemer Enchanting Machine Remote"
@@ -248,6 +267,30 @@ local function syncAttunementAbility(player)
     if not ok then
         dbg.error("Attune", "Ability sync failed", tostring(err))
     end
+end
+
+-- Testing/debug: force attunement on or off without the Heart pilgrimage.
+-- Console: `luag` then I.EnchantMachine.setAttuned(true|false).
+-- Turning it off strips the Heart's Resonance ability for a clean state.
+local function setAttuned(value, player)
+    attuned = not not value
+    updateSharedData()
+    if attuned then
+        syncAttunementAbility(player)
+    else
+        player = isValidObject(player) and player or world.players[1]
+        if isValidObject(player) and attuneAbility then
+            pcall(function()
+                local spells = types.Actor.spells(player)
+                if spells[attuneAbility.id] then
+                    spells:remove(attuneAbility.id)
+                end
+            end)
+        end
+        attuneAbility = nil
+    end
+    dbg.info("Attune", "setAttuned(" .. tostring(attuned) .. ")")
+    return attuned
 end
 
 -- Get current soul power in the bank
@@ -475,6 +518,102 @@ local function rechargeItem(item, actor, settings)
     return true, "Recharged to " .. math.floor(maxCharge) .. "/" .. math.floor(maxCharge) .. ". Soul power remaining: " .. remaining
 end
 
+-- Reinforce Charge: enlarge an enchanted item's maximum charge pool by minting
+-- a derived enchantment record with a bigger charge and swapping the item to a
+-- record pointing at it. Costs 1 soul power per charge point (consistent with
+-- recharge). The item's CURRENT charge is preserved — top up via Recharge.
+local function reinforceCharge(item, extraCharge, actor, settings)
+    dbg.startTimer("reinforceCharge")
+
+    settings = settings or getSettings()
+    if not settings.enableMachine then
+        dbg.endTimer("reinforceCharge")
+        return false, "Machine is disabled"
+    end
+    if not extraCharge or extraCharge <= 0 then
+        dbg.endTimer("reinforceCharge")
+        return false, "Increase must be positive"
+    end
+    extraCharge = math.floor(extraCharge)
+
+    local record, oldData, typeMod = getEnchantable(item)
+    if not record then
+        dbg.endTimer("reinforceCharge")
+        return false, "Only weapons, armor, and clothing can be reinforced"
+    end
+    if not record.enchant or record.enchant == "" then
+        dbg.endTimer("reinforceCharge")
+        return false, "Item is not enchanted"
+    end
+
+    local ench = core.magic.enchantments.records[record.enchant]
+    if not ench then
+        dbg.endTimer("reinforceCharge")
+        return false, "The enchantment cannot be read"
+    end
+    if ench.type == core.magic.ENCHANTMENT_TYPE.ConstantEffect then
+        dbg.endTimer("reinforceCharge")
+        return false, "Constant enchantments have no charge pool to reinforce"
+    end
+
+    if soulPower < extraCharge then
+        dbg.endTimer("reinforceCharge")
+        return false, "Not enough soul power (need " .. extraCharge .. ", have " .. math.floor(soulPower) .. ")"
+    end
+
+    local oldMax = math.floor(ench.charge or 0)
+    local newMax = oldMax + extraCharge
+    -- Current charge carries over unchanged; a missing itemData value means the
+    -- item was at its old maximum.
+    local currentCharge = (oldData and oldData.enchantmentCharge) or oldMax
+
+    local existingUpgrade, baseRecordId = getItemUpgradeAmount(item, record, typeMod)
+    local ok, result = pcall(function()
+        local enchDraft = core.magic.enchantments.createRecordDraft({
+            type = ench.type,
+            isAutocalc = false,
+            cost = math.max(1, math.floor(ench.cost or 1)),
+            charge = newMax,
+            effects = appendEffects({}, ench.effects),
+        })
+        local enchId = world.createRecord(enchDraft).id
+
+        local draft = typeMod.createRecordDraft({ template = record, enchant = enchId })
+        local newRecordId = world.createRecord(draft).id
+        local newItem = world.createObject(newRecordId, 1)
+
+        local newData = typeMod.itemData(newItem)
+        if newData then
+            if oldData and oldData.condition then newData.condition = oldData.condition end
+            newData.enchantmentCharge = currentCharge
+        end
+
+        if actor and types.Actor.objectIsInstance(actor) then
+            newItem:moveInto(types.Actor.inventory(actor))
+        end
+        item:remove(1)
+
+        return { newRecordId = newRecordId }
+    end)
+    if not ok then
+        dbg.error("Reinforce", "Record swap failed", tostring(result))
+        dbg.endTimer("reinforceCharge")
+        return false, "The machine could not reinforce that item"
+    end
+
+    local _success, remaining = subtractSoulPower(extraCharge)
+    itemBaseRecords[result.newRecordId] = baseRecordId
+    setUpgradedCapacity(result.newRecordId, existingUpgrade)
+
+    dbg.info("Reinforce", "Charge " .. oldMax .. " -> " .. newMax .. " on " .. (record.name or "item"))
+    dbg.trackMetric("totalSoulPowerSpent", extraCharge)
+    dbg.endTimer("reinforceCharge")
+
+    return true, string.format(
+        "Reinforced %s: charge pool %d -> %d. Soul power remaining: %d",
+        record.name or "item", oldMax, newMax, math.floor(remaining))
+end
+
 -- Upgrade an item's enchantment capacity by registering a new derived record
 -- and swapping the inventory item to it. customName (optional) renames the
 -- upgraded item.
@@ -640,6 +779,126 @@ local function removeEnchantment(item, actor, settings)
         record.name or "item", refund)
 end
 
+-- Selectively unweave one effect from an item's enchantment (attunement perk).
+-- Mints a replacement enchantment record minus the chosen effect and swaps the
+-- item to a derived record pointing at it — same pattern as removeEnchantment.
+-- Refunds a per-effect share of the full-removal refund. Falls back to full
+-- removal when only one effect remains.
+local function removeEnchantEffect(item, effectIndex, actor, settings)
+    dbg.startTimer("removeEnchantEffect")
+
+    settings = settings or getSettings()
+    if not settings.enableMachine then
+        dbg.endTimer("removeEnchantEffect")
+        return false, "The machine is disabled"
+    end
+    if not attuned then
+        dbg.endTimer("removeEnchantEffect")
+        return false, "Only the Heart's resonance can unweave a single effect. Attune the resonator first."
+    end
+
+    local record, oldData, typeMod = getEnchantable(item)
+    if not record then
+        dbg.endTimer("removeEnchantEffect")
+        return false, "Only weapons, armor, and clothing can be modified"
+    end
+    if not record.enchant or record.enchant == "" then
+        dbg.endTimer("removeEnchantEffect")
+        return false, "Item is not enchanted"
+    end
+
+    local ench = core.magic.enchantments.records[record.enchant]
+    if not ench then
+        dbg.endTimer("removeEnchantEffect")
+        return false, "The enchantment cannot be read"
+    end
+
+    -- Copy the kept effects into plain tables (counting via ipairs — the
+    -- effects list is engine userdata, so # isn't guaranteed).
+    local kept, total, removedId = {}, 0, nil
+    for i, e in ipairs(ench.effects) do
+        total = total + 1
+        if i == effectIndex then
+            removedId = e.id
+        else
+            kept[#kept + 1] = {
+                id = e.id,
+                affectedSkill = e.affectedSkill,
+                affectedAttribute = e.affectedAttribute,
+                range = e.range,
+                area = e.area,
+                magnitudeMin = e.magnitudeMin,
+                magnitudeMax = e.magnitudeMax,
+                duration = e.duration,
+            }
+        end
+    end
+    if total <= 1 then
+        dbg.endTimer("removeEnchantEffect")
+        return removeEnchantment(item, actor, settings)
+    end
+    if not removedId then
+        dbg.endTimer("removeEnchantEffect")
+        return false, "That effect no longer exists on the item"
+    end
+
+    -- Per-effect share of the full-removal refund (charge, falling back to cost).
+    local charge = ench.charge or 0
+    local fullRefund = math.floor(charge > 0 and charge or (ench.cost or 0))
+    local refund = math.floor(fullRefund / total)
+
+    local existingUpgrade, baseRecordId = getItemUpgradeAmount(item, record, typeMod)
+    local ok, result = pcall(function()
+        local enchDraft = core.magic.enchantments.createRecordDraft({
+            type = ench.type,
+            isAutocalc = false,
+            cost = math.max(1, math.floor(ench.cost or 1)),
+            charge = charge,
+            effects = kept,
+        })
+        local enchId = world.createRecord(enchDraft).id
+
+        local draft = typeMod.createRecordDraft({ template = record, enchant = enchId })
+        local newRecordId = world.createRecord(draft).id
+        local newItem = world.createObject(newRecordId, 1)
+
+        -- Carry over condition and remaining charge — the pool is unchanged.
+        local newData = typeMod.itemData(newItem)
+        if newData and oldData then
+            if oldData.condition then newData.condition = oldData.condition end
+            if oldData.enchantmentCharge then newData.enchantmentCharge = oldData.enchantmentCharge end
+        end
+
+        if actor and types.Actor.objectIsInstance(actor) then
+            newItem:moveInto(types.Actor.inventory(actor))
+        end
+        item:remove(1)
+
+        return { newRecordId = newRecordId }
+    end)
+    if not ok then
+        dbg.error("RemoveEffect", "Record swap failed", tostring(result))
+        dbg.endTimer("removeEnchantEffect")
+        return false, "The machine could not unweave that effect"
+    end
+
+    itemBaseRecords[result.newRecordId] = baseRecordId
+    setUpgradedCapacity(result.newRecordId, existingUpgrade)
+    if refund > 0 then addSoulPower(refund) end
+
+    local effectName = removedId
+    local effRec = core.magic.effects.records[removedId]
+    if effRec and effRec.name then effectName = effRec.name end
+
+    dbg.info("RemoveEffect", "Unwove " .. effectName .. " from " .. (record.name or "item") .. ", refunded " .. refund)
+    dbg.incrementMetric("totalEnchantRemovals")
+    dbg.endTimer("removeEnchantEffect")
+
+    return true, string.format(
+        "Unwove %s from %s. Refunded %d soul power.",
+        effectName, record.name or "item", refund)
+end
+
 -- Enchant an unenchanted item by deriving an Enchantment record from one of the
 -- player's known spells and swapping the inventory item to a record that points at
 -- it. This replaces the old native-UI handoff (I.UI.addMode('Enchanting')), which
@@ -678,9 +937,21 @@ local function addEnchantment(item, actor, settings, eventData)
         dbg.endTimer("addEnchantment")
         return false, "Only weapons, armor, and clothing can be enchanted"
     end
+
+    -- Weaving into an already-enchanted item is an attunement perk: the new
+    -- spell's effects are appended to the existing enchantment's and the matrix
+    -- is re-forged (same price as a fresh enchant, arrives fully charged).
+    local existingEnch = nil
     if record.enchant and record.enchant ~= "" then
-        dbg.endTimer("addEnchantment")
-        return false, "Item is already enchanted"
+        if not attuned then
+            dbg.endTimer("addEnchantment")
+            return false, "Only the Heart's resonance can weave into an existing enchantment. Attune the resonator first."
+        end
+        existingEnch = core.magic.enchantments.records[record.enchant]
+        if not existingEnch then
+            dbg.endTimer("addEnchantment")
+            return false, "The existing enchantment cannot be read"
+        end
     end
     if not record.enchantCapacity or record.enchantCapacity <= 0 then
         dbg.endTimer("addEnchantment")
@@ -693,29 +964,23 @@ local function addEnchantment(item, actor, settings, eventData)
         return false, "Unknown spell"
     end
 
-    -- Copy the spell's effects into plain tables. MagicEffectWithParams shares the
-    -- same field set between spells and enchantments, so this maps straight across.
+    -- Copy effects into plain tables. When weaving, the existing enchantment's
+    -- effects come first.
     local effects = {}
-    for _, e in ipairs(spell.effects) do
-        effects[#effects + 1] = {
-            id = e.id,
-            affectedSkill = e.affectedSkill,
-            affectedAttribute = e.affectedAttribute,
-            range = e.range,
-            area = e.area,
-            magnitudeMin = e.magnitudeMin,
-            magnitudeMax = e.magnitudeMax,
-            duration = e.duration,
-        }
-    end
-    if #effects == 0 then
+    if existingEnch then appendEffects(effects, existingEnch.effects) end
+    local existingCount = #effects
+    appendEffects(effects, spell.effects)
+    if #effects == existingCount then
         dbg.endTimer("addEnchantment")
         return false, "That spell has no usable effects"
     end
 
     local enchType
     local requestedType = eventData and eventData.enchantType
-    if requestedType then
+    if existingEnch then
+        -- Weaving inherits the existing enchantment's cast type.
+        enchType = existingEnch.type
+    elseif requestedType then
         enchType = PLAYER_ENCHANT_TYPES[requestedType]
         if not enchType then
             dbg.endTimer("addEnchantment")
@@ -751,7 +1016,8 @@ local function addEnchantment(item, actor, settings, eventData)
         dbg.endTimer("addEnchantment")
         return false, "Item cannot hold enchantments"
     end
-    local castCost = math.max(1, math.floor(spell.cost or 1))
+    local castCost = math.max(1, math.floor(
+        ((existingEnch and existingEnch.cost) or 0) + (spell.cost or 1)))
 
     -- Charge the bank for filling the enchantment to full (1 power per charge point).
     if soulPower < charge then
@@ -813,13 +1079,14 @@ local function addEnchantment(item, actor, settings, eventData)
     setUpgradedCapacity(result.newRecordId, existingUpgrade)
 
     local shownName = customName or record.name or "item"
-    dbg.info("AddEnchant", "Enchanted " .. shownName .. " with " .. (spell.name or spellId) .. " (charge " .. charge .. ")")
+    local verb = existingEnch and "Wove" or "Imbued"
+    dbg.info("AddEnchant", verb .. " " .. shownName .. " with " .. (spell.name or spellId) .. " (charge " .. charge .. ")")
     dbg.incrementMetric("totalEnchantsAdded")
     dbg.endTimer("addEnchantment")
 
     return true, string.format(
-        "Imbued %s with %s. Soul power remaining: %d",
-        shownName, spell.name or spellId, math.floor(remaining))
+        "%s %s with %s. Soul power remaining: %d",
+        verb, shownName, spell.name or spellId, math.floor(remaining))
 end
 
 -- Calculate effective enchantment capacity for new enchantments
@@ -1169,8 +1436,19 @@ local function onUpgradeItemEvent(eventData)
     end, eventData)
 end
 
+local function onReinforceChargeEvent(eventData)
+    handleOperationEvent('reinforce', function(item, actor, settings, ev)
+        return reinforceCharge(item, ev.amount or 0, actor, settings)
+    end, eventData)
+end
+
 local function onRemoveEnchantEvent(eventData)
-    handleOperationEvent('remove-enchant', removeEnchantment, eventData)
+    handleOperationEvent('remove-enchant', function(item, actor, settings, ev)
+        if ev.effectIndex then
+            return removeEnchantEffect(item, ev.effectIndex, actor, settings)
+        end
+        return removeEnchantment(item, actor, settings)
+    end, eventData)
 end
 
 local function onAddEnchantEvent(eventData)
@@ -1258,7 +1536,9 @@ return {
 
         -- Item operations
         rechargeItem = rechargeItem,
+        reinforceCharge = reinforceCharge,
         removeEnchantment = removeEnchantment,
+        removeEnchantEffect = removeEnchantEffect,
         addEnchantment = addEnchantment,
         canBeEnchanted = canBeEnchanted,
         getItemCapacity = getItemCapacity,
@@ -1266,6 +1546,7 @@ return {
 
         -- Attunement
         getAttuned = function() return attuned end,
+        setAttuned = setAttuned,  -- testing/debug: I.EnchantMachine.setAttuned(true|false) from `luag`
 
         -- Custom summons
         markCreature = markCreature,
@@ -1292,6 +1573,7 @@ return {
         EnchantMachine_DepositGem = onDepositGemEvent,
         EnchantMachine_DepositAll = onDepositAllEvent,
         EnchantMachine_RechargeItem = onRechargeItemEvent,
+        EnchantMachine_ReinforceCharge = onReinforceChargeEvent,
         EnchantMachine_UpgradeItem = onUpgradeItemEvent,
         EnchantMachine_RemoveEnchant = onRemoveEnchantEvent,
         EnchantMachine_AddEnchant = onAddEnchantEvent,

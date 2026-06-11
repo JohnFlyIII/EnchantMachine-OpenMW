@@ -22,6 +22,7 @@ The result: Create enchanted items with 10x, 50x, or even 100x the normal capaci
   - **Deposit All** empties every filled gem in one click, with a total-power preview
   - **Azura's Star** is never consumed — it releases its soul and stays in your inventory
 - **Item Recharge**: Restore charges to enchanted items using stored soul power (1:1 ratio)
+- **Reinforce Charge Pool**: Permanently enlarge an enchanted item's maximum charge (1 power per point) — current charge is kept, constant enchantments excluded
 - **Enhanced Enchanting**: Permanently increase item enchantment capacity before enchanting
   - Upgrade unenchanted items to have much higher capacity (configurable, default 100:1 soul power cost)
   - Then enchant them directly through the machine or normally at any enchanter
@@ -38,6 +39,8 @@ The result: Create enchanted items with 10x, 50x, or even 100x the normal capaci
 - **Attune Resonator**: Attunes the device to the Heart of Lorkhan — only succeeds within the final Dagoth Ur chamber (`Akulakhan's Chamber`). Attunement is permanent and grants:
   - **Heart's Resonance**: a constant +50 Enchant ability (configurable 0–100 in settings, updates live)
   - **Soul Resonance**: all deposited and siphoned souls yield 50% more power (enchantment-removal refunds are deliberately not amplified)
+  - **Weaving**: Add Enchantment can target already-enchanted items — new effects join the existing enchantment (inheriting its cast type); the matrix is re-forged at the standard enchant price and arrives fully charged
+  - **Unweaving**: Remove Enchantment can strip a single effect from a multi-effect enchantment for a proportional refund, instead of all-or-nothing
   - Note: the Heart is destroyed at the end of the main quest — attune before then, or never
 
 ### Technical Features ✅

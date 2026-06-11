@@ -135,9 +135,12 @@ local createMenu
 local createMainMenu
 local showDepositMenu
 local showRechargeMenu
+local showReinforceMenu
+local showReinforceAmountMenu
 local showUpgradeMenu
 local showUpgradeAmountMenu
 local showRemoveEnchantMenu
+local showRemoveEffectMenu
 local showAddEnchantMenu
 local showEnchantTypeMenu
 local showSpellSelectMenu
@@ -458,21 +461,50 @@ local function getEnchantedItems()
     return items
 end
 
--- Unenchanted weapons/armor/clothing that can hold an enchantment — candidates for
--- Add Enchantment. Same filter as getUpgradeableItems but kept separate so the two
--- features can diverge (Add doesn't depend on the upgrade feature being unlocked).
+-- Weapons/armor/clothing that can hold an enchantment — candidates for Add
+-- Enchantment. Unenchanted items always qualify; once attuned, enchanted items
+-- are also offered (the "weave" perk appends effects to the existing
+-- enchantment). Kept separate from getUpgradeableItems so the features can
+-- diverge (Add doesn't depend on the upgrade feature being unlocked).
 local function getEnchantableItems()
+    local includeEnchanted = isAttuned()
     local items = {}
     for _, item in ipairs(types.Actor.inventory(self):getAll()) do
         local record = getEnchantableRecord(item)
-        if record
-            and record.enchantCapacity and record.enchantCapacity > 0
-            and (not record.enchant or record.enchant == "")
-        then
-            table.insert(items, { item = item, record = record })
+        if record and record.enchantCapacity and record.enchantCapacity > 0 then
+            local enchanted = record.enchant and record.enchant ~= ""
+            if not enchanted then
+                table.insert(items, { item = item, record = record })
+            elseif includeEnchanted then
+                table.insert(items, { item = item, record = record, enchanted = true })
+            end
         end
     end
     return items
+end
+
+-- Human-readable one-liner for a MagicEffectWithParams ("Fire Damage 10-30 pts, 5s").
+local function describeEffect(e)
+    local name = e.id
+    local ok, effRec = pcall(function() return core.magic.effects.records[e.id] end)
+    if ok and effRec and effRec.name then name = effRec.name end
+    local qualifier = e.affectedSkill or e.affectedAttribute
+    if qualifier then name = name .. ": " .. qualifier end
+
+    local parts = { name }
+    local maxMag = e.magnitudeMax or 0
+    if maxMag > 0 then
+        local minMag = e.magnitudeMin or maxMag
+        if minMag == maxMag then
+            table.insert(parts, minMag .. " pts")
+        else
+            table.insert(parts, minMag .. "-" .. maxMag .. " pts")
+        end
+    end
+    if (e.duration or 0) > 0 then
+        table.insert(parts, e.duration .. "s")
+    end
+    return table.concat(parts, ", ")
 end
 
 -- The player's known, castable spells (excludes abilities, diseases, powers, etc.)
@@ -636,6 +668,140 @@ showRechargeMenu = function()
         info = "Soul Power: " .. math.floor(soulPower) .. " | Cost: 1 power per charge point",
         items = items,
         onBack = function() createMainMenu() end,
+    }
+end
+
+-- Reinforce Charge: enlarge an enchanted item's max charge pool (1 power per
+-- point, consistent with recharge). Constant enchantments have no pool.
+showReinforceMenu = function()
+    closeMenu()
+
+    local candidates = {}
+    for _, entry in ipairs(getEnchantedItems()) do
+        local ok, ench = pcall(function()
+            return core.magic.enchantments.records[entry.record.enchant]
+        end)
+        if ok and ench and ench.type ~= core.magic.ENCHANTMENT_TYPE.ConstantEffect then
+            entry.maxCharge = math.floor(ench.charge or 0)
+            table.insert(candidates, entry)
+        end
+    end
+
+    if #candidates == 0 then
+        ui.showMessage("You have no charged enchanted items to reinforce.")
+        async:newUnsavableSimulationTimer(1.5, function() createMainMenu() end)
+        return
+    end
+
+    local items = {}
+    for _, entry in ipairs(candidates) do
+        table.insert(items, createButton(
+            string.format("%s (pool: %d)", entry.record.name or "Item", entry.maxCharge),
+            function() showReinforceAmountMenu(entry) end
+        ))
+    end
+
+    createMenu{
+        header = { type = 'boxed', text = "Reinforce Charge" },
+        info = string.format("Soul Power: %d | Cost: 1 power per charge point",
+            math.floor(getSoulPower())),
+        warning = "Enlarges the maximum charge pool. Current charge is kept — top up via Recharge.",
+        items = items,
+        onBack = function() createMainMenu() end,
+    }
+end
+
+showReinforceAmountMenu = function(entry)
+    closeMenu()
+
+    local soulPower = getSoulPower()
+    local itemName = entry.record.name or "Item"
+    local maxCharge = entry.maxCharge or 0
+    local maxAffordable = math.floor(soulPower)
+
+    local function sendReinforce(amount)
+        core.sendGlobalEvent('EnchantMachine_ReinforceCharge', {
+            actor = self.object,
+            item = entry.item,
+            amount = amount,
+            settings = getSettings(),
+        })
+        ui.showMessage("Reinforcing charge pool...")
+        closeMenu()
+    end
+
+    local items = {}
+    for _, amount in ipairs({100, 500, 1000}) do
+        table.insert(items, createButton(
+            string.format("+%d charge (%d power) → %d pool", amount, amount, maxCharge + amount),
+            function() sendReinforce(amount) end,
+            soulPower >= amount
+        ))
+    end
+    if maxAffordable > 0 then
+        table.insert(items, createButton(
+            string.format("+%d charge (Max affordable)", maxAffordable),
+            function() sendReinforce(maxAffordable) end
+        ))
+    end
+
+    local customAmount = nil
+    local editProps = { text = '', size = util.vector2(240, 24) }
+    local statusProps = {
+        text = string.format("Type an amount and Apply (max affordable: %d)", maxAffordable),
+        textSize = 14,
+    }
+
+    local function onAmountChanged(text)
+        editProps.text = text
+        customAmount = tonumber(text:match('^%s*(%d+)%s*$') or '')
+        if customAmount and customAmount >= 1 then
+            if customAmount <= soulPower then
+                statusProps.text = string.format("+%d charge costs %d power → %d pool",
+                    customAmount, customAmount, maxCharge + customAmount)
+                statusProps.textColor = util.color.rgb(0.5, 1, 0.5)
+            else
+                statusProps.text = string.format("Costs %d power — you only have %d",
+                    customAmount, math.floor(soulPower))
+                statusProps.textColor = util.color.rgb(1, 0.4, 0.4)
+            end
+        else
+            customAmount = nil
+            statusProps.text = text == '' and
+                string.format("Type an amount and Apply (max affordable: %d)", maxAffordable)
+                or "Enter a whole number"
+            statusProps.textColor = nil
+        end
+        if currentMenu then currentMenu:update() end
+    end
+
+    table.insert(items, spacer(10))
+    table.insert(items, textLine("Custom amount:"))
+    table.insert(items, textInput(editProps, onAmountChanged))
+    table.insert(items, {
+        type = ui.TYPE.Text,
+        template = I.MWUI.templates.textNormal,
+        props = statusProps,
+    })
+    table.insert(items, createButton("Apply Custom Amount", function()
+        if not customAmount then
+            ui.showMessage("Enter a whole number of charge points first.")
+            return
+        end
+        if customAmount > soulPower then
+            ui.showMessage(string.format("Not enough soul power (need %d, have %d).",
+                customAmount, math.floor(soulPower)))
+            return
+        end
+        sendReinforce(customAmount)
+    end))
+
+    createMenu{
+        header = { type = 'boxed', text = "Reinforce: " .. itemName },
+        info = string.format("Current pool: %d | Soul Power: %d | Rate: 1 power per point",
+            maxCharge, math.floor(soulPower)),
+        items = items,
+        onBack = showReinforceMenu,
     }
 end
 
@@ -808,23 +974,90 @@ showRemoveEnchantMenu = function()
         table.insert(items, createButton(
             itemName,
             function()
-                core.sendGlobalEvent('EnchantMachine_RemoveEnchant', {
-                    actor = self.object,
-                    item = entry.item,
-                    settings = getSettings(),
-                })
-                ui.showMessage("Removing enchantment...")
-                closeMenu()
+                -- Attuned and multi-effect: offer per-effect unweaving.
+                local effectCount = 0
+                if isAttuned() then
+                    local ok, ench = pcall(function()
+                        return core.magic.enchantments.records[entry.record.enchant]
+                    end)
+                    if ok and ench then
+                        for _ in ipairs(ench.effects) do effectCount = effectCount + 1 end
+                    end
+                end
+                if effectCount > 1 then
+                    showRemoveEffectMenu(entry)
+                else
+                    core.sendGlobalEvent('EnchantMachine_RemoveEnchant', {
+                        actor = self.object,
+                        item = entry.item,
+                        settings = getSettings(),
+                    })
+                    ui.showMessage("Removing enchantment...")
+                    closeMenu()
+                end
             end
         ))
     end
 
     createMenu{
         header = { type = 'boxed', text = "Remove Enchantment" },
-        info = "Strips an item's enchantment and refunds soul power.",
+        info = isAttuned()
+            and "Strips enchantments for a refund. The Heart's resonance allows unweaving single effects."
+            or "Strips an item's enchantment and refunds soul power.",
         warning = "The item can then be enchanted normally (or have its capacity upgraded here).",
         items = items,
         onBack = function() createMainMenu() end,
+    }
+end
+
+-- Per-effect removal (attunement perk): list the enchantment's effects, strip
+-- one for a proportional refund, or fall through to full removal.
+showRemoveEffectMenu = function(entry)
+    closeMenu()
+
+    local ench = core.magic.enchantments.records[entry.record.enchant]
+    if not ench then
+        ui.showMessage("The enchantment cannot be read.")
+        async:newUnsavableSimulationTimer(1.5, function() showRemoveEnchantMenu() end)
+        return
+    end
+
+    local function sendRemove(effectIndex)
+        core.sendGlobalEvent('EnchantMachine_RemoveEnchant', {
+            actor = self.object,
+            item = entry.item,
+            effectIndex = effectIndex,
+            settings = getSettings(),
+        })
+        ui.showMessage(effectIndex and "Unweaving effect..." or "Removing enchantment...")
+        closeMenu()
+    end
+
+    -- Mirror GLOBAL's refund math for the per-effect preview.
+    local effectCount = 0
+    for _ in ipairs(ench.effects) do effectCount = effectCount + 1 end
+    local charge = ench.charge or 0
+    local fullRefund = math.floor(charge > 0 and charge or (ench.cost or 0))
+    local perEffectRefund = effectCount > 0 and math.floor(fullRefund / effectCount) or 0
+
+    local items = {}
+    for i, effect in ipairs(ench.effects) do
+        table.insert(items, createButton(
+            string.format("Unweave: %s (+%d power)", describeEffect(effect), perEffectRefund),
+            function() sendRemove(i) end
+        ))
+    end
+    table.insert(items, spacer(10))
+    table.insert(items, createButton(
+        string.format("Remove Entire Enchantment (+%d power)", fullRefund),
+        function() sendRemove(nil) end
+    ))
+
+    createMenu{
+        header = { type = 'boxed', text = "Unweave: " .. (entry.record.name or "Item") },
+        info = "Choose a single effect to unweave, or strip the whole enchantment.",
+        items = items,
+        onBack = function() showRemoveEnchantMenu() end,
     }
 end
 
@@ -846,15 +1079,25 @@ showAddEnchantMenu = function()
     for _, entry in ipairs(candidates) do
         local itemName = entry.record.name or "Item"
         local capacity = math.floor(entry.record.enchantCapacity or 0)
-        table.insert(items, createButton(
-            string.format("%s (Capacity: %d)", itemName, capacity),
-            function() showEnchantTypeMenu(entry) end
-        ))
+        if entry.enchanted then
+            -- Weaving inherits the existing cast type, so skip the type menu.
+            table.insert(items, createButton(
+                string.format("%s (Enchanted — weave in more)", itemName),
+                function() showSpellSelectMenu(entry, nil) end
+            ))
+        else
+            table.insert(items, createButton(
+                string.format("%s (Capacity: %d)", itemName, capacity),
+                function() showEnchantTypeMenu(entry) end
+            ))
+        end
     end
 
     createMenu{
         header = { type = 'boxed', text = "Add Enchantment" },
-        info = "Choose an item, then how it casts, then a known spell to imbue.",
+        info = isAttuned()
+            and "Choose an item, then a spell. The Heart's resonance lets you weave into existing enchantments."
+            or "Choose an item, then how it casts, then a known spell to imbue.",
         items = items,
         onBack = function() createMainMenu() end,
     }
@@ -909,10 +1152,22 @@ showSpellSelectMenu = function(entry, enchantType)
         return (a.name or a.id):lower() < (b.name or b.id):lower()
     end)
 
+    -- Weave mode (attunement perk): adding to an already-enchanted item. The
+    -- existing cast type is inherited, so enchantType arrives as nil.
+    local weaveType = nil
+    if entry.enchanted then
+        local ok, existing = pcall(function()
+            return core.magic.enchantments.records[entry.record.enchant]
+        end)
+        weaveType = ok and existing and existing.type or nil
+    end
+
     -- Pin the machine's Soul Siphon template for strike enchantments. The player
     -- never "knows" this spell — it's machine tech injected by load.lua, and the
     -- effect feeds soul power straight into the bank on every hit.
-    if enchantType == 'CastOnStrike' then
+    if enchantType == 'CastOnStrike'
+        or weaveType == core.magic.ENCHANTMENT_TYPE.CastOnStrike
+    then
         local siphon = core.magic.spells.records['em_soul_siphon_spell']
         if siphon then
             local known = false
@@ -992,7 +1247,16 @@ showSpellSelectMenu = function(entry, enchantType)
 
     rebuildList()
 
-    local typeInfo = ENCHANT_TYPE_INFO[enchantType] or ENCHANT_TYPE_INFO.CastOnUse
+    local typeInfo
+    if entry.enchanted then
+        typeInfo = {
+            label = "Weave into existing enchantment",
+            note = "New effects join the current enchantment. The matrix is re-forged and arrives fully charged.",
+        }
+    else
+        typeInfo = ENCHANT_TYPE_INFO[enchantType] or ENCHANT_TYPE_INFO.CastOnUse
+    end
+
     createMenu{
         header = { type = 'boxed', text = "Imbue: " .. (entry.record.name or "Item") },
         info = string.format("%s | Soul Power: %d | Cost to enchant: %d power",
@@ -1009,7 +1273,9 @@ showSpellSelectMenu = function(entry, enchantType)
             spacer(6),
             listFlex,
         },
-        onBack = function() showEnchantTypeMenu(entry) end,
+        onBack = entry.enchanted
+            and function() showAddEnchantMenu() end
+            or function() showEnchantTypeMenu(entry) end,
     }
 end
 
@@ -1037,11 +1303,13 @@ showNameItemMenu = function(entry, enchantType, spell)
         closeMenu()
     end
 
+    local typeLabel = entry.enchanted and "Weave"
+        or (ENCHANT_TYPE_INFO[enchantType] or ENCHANT_TYPE_INFO.CastOnUse).label
+
     createMenu{
         header = { type = 'boxed', text = "Name Your Creation" },
         info = string.format("Imbuing %s with %s (%s)",
-            originalName, spell.name or spell.id,
-            (ENCHANT_TYPE_INFO[enchantType] or ENCHANT_TYPE_INFO.CastOnUse).label),
+            originalName, spell.name or spell.id, typeLabel),
         warning = "Leave blank to keep the name \"" .. originalName .. "\".",
         items = {
             textInput(nameProps, function(text)
@@ -1106,6 +1374,7 @@ createMainMenu = function()
     local items = {}
     table.insert(items, createButton("Deposit Soul Gems", showDepositMenu))
     table.insert(items, createButton("Recharge Enchanted Items", showRechargeMenu))
+    table.insert(items, createButton("Reinforce Charge Pool", showReinforceMenu))
     table.insert(items, createButton("Add Enchantment", showAddEnchantMenu))
     table.insert(items, createButton("Remove Enchantment", showRemoveEnchantMenu))
     table.insert(items, createButton("Mark Summon Creature", showCaptureSummonMenu))
@@ -1230,6 +1499,8 @@ return {
                 reopen = showDepositMenu
             elseif eventData.operation == 'recharge' then
                 reopen = showRechargeMenu
+            elseif eventData.operation == 'reinforce' then
+                reopen = showReinforceMenu
             elseif eventData.operation == 'upgrade' then
                 reopen = showUpgradeMenu
             elseif eventData.operation == 'remove-enchant' then
